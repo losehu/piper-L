@@ -1,4 +1,4 @@
-# 本机部署
+# 命令行部署
 
 ## 1. 生成并修改本地配置
 
@@ -80,7 +80,7 @@ Space、Esc 或 Ctrl+C 会锁定停止并由独立进程发送 `0x150/01` 阻尼
 
 π0.5 模型服务只监听 `127.0.0.1:8000`，不直接操作 CAN 或相机。
 
-## 5. VPP2 私有资产与执行方式
+## 5. VPP2 本地同步模式
 
 把 `config.yaml` 的 `vpp2.root` 指向已准备好的 VPP2 私有资产目录；也可用 `VPP2_DEPLOY_ROOT` 指定。其目录结构为：
 
@@ -98,7 +98,7 @@ vpp2-assets/
   assets/text_context.pt
 ```
 
-独立环境依赖见 `deployment/vpp2_runtime/requirements.txt`，VPP2 源码固定在 `deployment/vendor/vpp2`。当前 .102 部署复用已准备好的环境、2250 权重、训练归一化和文本缓存，不重新下载训练数据。模型计算全部在 .102。
+独立环境依赖见 `deployment/vpp2_runtime/requirements.txt`，VPP2 源码固定在 `deployment/vendor/vpp2`。该模式使用已有2250权重、训练归一化和文本缓存，模型计算全部在机械臂端。设置 `vpp2.inference=local_sync`，并清除 `VPP2_REMOTE_PORT` 后可选择该模式。
 
 默认 `vpp2.denoising_steps=5`，显式设成 `10` 可复现旧采样设置；只影响 VPP2。`vpp2.torch_compile` 默认 false，`--compile` 可启用。编译目标是 `MoT.forward_action_with_video_cache`，关闭 CUDA graphs 以控制24GB显存占用；没有编译整个视频主干。首次编译在读取保存的观测热身时完成，成功前不会进入机械臂使能阶段。
 
@@ -106,7 +106,7 @@ VPP2 服务监听 `127.0.0.1:8768`。启动器在持有共享 CAN 文件锁后�
 
 VPP2 接收原始640×480双目RGB，复现训练时224×168缩放和上下黑边，再横向拼接。服务已把关节 delta 还原成绝对弧度，控制端不再次加当前状态；夹爪为绝对米。视频主干权重使用 INT8 存储并临时还原 BF16 运算，动作专家 BF16，CLIP/VAE 分阶段上显卡。
 
-VPP2 固定采用同步 `plan_execute` 调度：以30Hz完整执行32帧、120Hz插值与滤波，结束后保持块末目标；等待姿态稳定至少300ms，再采集停稳之后的双相机和状态观测，发起下一次推理，返回后执行下一块。动作执行期间不请求下一块，也不复用停稳前的观测。首次动作同样先停稳取观测。
+本地模式采用同步 `plan_execute` 调度：以30Hz完整执行32帧、120Hz插值与滤波，结束后保持块末目标；等待姿态稳定至少300ms，再采集停稳之后的双相机和状态观测，发起下一次推理，返回后执行下一块。动作执行期间不请求下一块，也不复用停稳前的观测。首次动作同样先停稳取观测。
 
 推理请求由工作线程等待响应，用于让120Hz位置保持命令和独立键盘急停继续运行，动作块之间仍严格串行。超时、固件故障或控制心跳异常仍停止。VPP2 的该调度不改变 π0.5 的异步 RTC、块长度或平滑参数。VPP2 闭环抓取尚未验证。
 
@@ -117,3 +117,51 @@ VPP2 固定采用同步 `plan_execute` 调度：以30Hz完整执行32帧、120Hz
 ```
 
 该检查会加载模型并占用GPU和共享文件锁，不能与其他控制程序同时运行。
+
+## 6. VPP2 单卡 H100 异步 RTC（当前部署）
+
+H100 保留原2250动作权重和32帧/30Hz预测窗口，5步去噪。视频和动作主干以BF16常驻GPU，无INT8权重还原或CPU/GPU逐请求搬运；CLIP FP16、VAE FP32遵循原参考实现。动作去噪与视频条件前向使用 `torch.compile` 和 CUDA graphs。启动完成前执行热身及 A→B→A 输入新鲜性检查。
+
+在 H100 上准备与本地模式相同的私有资产，其中视频权重改为原始 `weights/video_step010000.pt`；`vpp2_runtime/server.py` 的 BF16 分支直接装载它。将本仓库 `deployment/vpp2_network`、`deployment/vpp2_runtime` 和 `deployment/vendor/vpp2/src` 放在服务器部署目录，模型 Python 环境使用 PyTorch2.7.1。服务器只监听回环端口19868，不连接机械臂。
+
+在能通过 SSH 同时连接 H100 和机械臂的工作站执行：
+
+```bash
+cp -n deployment/h100_runtime.example.json deployment/h100_runtime.json
+# 填写 SSH 别名、服务器部署/环境/资产/源码/热身观测路径
+python3 tools/vpp2_h100_bridge.py --config deployment/h100_runtime.json
+```
+
+桥接器启动或复用本项目拥有的单卡服务，建立工作站本地21968与机械臂回环21969两段加密转发。保持桥接器运行；工作站或隧道退出会中断远程推理。桥接器不使能、不启动机械臂，不终止其他GPU任务。可使用 `--stop` 关闭本桥接器及隧道，H100模型仍保温。
+
+机械臂配置的 `vpp2` 子项设置如下，其他配置保留：
+
+```json
+{"inference":"h100_async_rtc","remote_port":21969,"max_inflight":2,
+ "denoising_steps":5,"torch_compile":true}
+```
+
+在机械臂机器的交互终端运行：
+
+```bash
+cd /home/arm/piper_pi05_rtc_cmd_20261112
+./check_vpp2_h100.sh  # 仅保存观测推理，不连接机械臂或相机
+./run_vpp2_h100.sh    # 自动准备后开始动作；Space/Esc/Ctrl+C阻尼停止
+```
+
+新入口也可通过环境变量选择远程模式，原 `./run.sh` 仍默认π0.5。远程不可用时拒绝启动，不自动回退本地模型。
+
+传输使用 HTTP/1.1 长连接、二进制请求及无损 WebP。机械臂端先执行与旧路径逐像素相同的 JPEG95→224×168缩放→上下黑边处理，再无损上传；每个请求核对像素哈希、编号、2250身份、5步计数、动作单位与32×7形状。
+
+两路请求按最近8次往返时间中位数的一半持续错峰，单个固定GPU线程依次计算。首次预测在保持姿态期间完成，随后每块使用真实采集时间，不重写时间戳；已过去的前缀被跳过，有效期止于采集时刻加32/30秒。新旧有效轨迹通过三次位置/速度修正衔接，并复用持续运行的输出滤波。这里是部署端重叠续块，没有增加VPP2训练时未用的去噪前缀约束。过期、网络错误或预测断流触发独立阻尼停止，不补播过期动作。
+
+无需机械臂的真实网络时序回放：
+
+```bash
+PYTHONPATH=.:vendor/pyAgxArm:vendor/openpi/packages/openpi-client/src \
+ .venv/bin/python -m vpp2_network.replay_rtc --sample offline_sample.npz \
+ --config config.yaml --output logs/h100_rtc_replay.json \
+ --requests 160 --camera-age 0.0666666667 --inflight 2
+```
+
+回放重复保存的图像/状态，使用模拟采集时间并额外预留两帧相机延迟；报告不代表真实相机或抓取成功率。代码不打开CAN，但取得共享文件锁以避开真实控制。

@@ -2,6 +2,8 @@
 import base64
 import io
 import json
+import os
+import http.client
 import threading
 import urllib.request
 import uuid
@@ -14,6 +16,21 @@ PROMPT='Pick up all the objects on the table and place them in the box.'
 
 class Vpp2Client:
     def __init__(self,settings):
+        self.remote=None
+        remote_port=os.environ.get('VPP2_REMOTE_PORT') or settings.get('vpp2_remote_port')
+        if remote_port:
+            if not settings.get('compile_vpp2') or settings['denoising_steps']!=5:
+                raise ValueError('Remote H100 VPP2 requires5 steps and --compile')
+            from vpp2_network.transport import PolicyClient
+            try:
+                self.remote=PolicyClient(int(remote_port),settings,
+                    os.environ.get('VPP2_REMOTE_CODEC','webp_prepared'))
+            except (OSError,http.client.HTTPException) as error:
+                # ensure_policy must not fall back to the local GPU on outage.
+                raise RuntimeError('H100 VPP2 unavailable; start the H100 bridge first: '+str(error)) from error
+            self.metadata=self.remote.metadata
+            print('VPP2：H100单卡BF16，5步编译推理，HTTP长连接。',flush=True)
+            return
         self.settings=settings
         self.url='http://127.0.0.1:%d'%settings['policy_port']
         self.opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -33,6 +50,7 @@ class Vpp2Client:
             execution_mode='plan_execute',checkpoint=settings.get('checkpoint','weights/best_action.pt'))
 
     def infer(self,observation,prompt):
+        if self.remote is not None:return self.remote.infer(observation,prompt)
         if self.closed.is_set():raise RuntimeError('VPP2 client closed')
         if prompt!=PROMPT:raise ValueError('VPP2 uses the fixed trained task text cache')
         self.request_id+=1;request_id='%s:%d'%(self.session,self.request_id)
@@ -61,4 +79,6 @@ class Vpp2Client:
         # Do NOT add observation.state a second time.
         return actions
 
-    def close(self):self.closed.set()
+    def close(self):
+        if self.remote is not None:self.remote.close()
+        else:self.closed.set()

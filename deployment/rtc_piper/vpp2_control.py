@@ -43,6 +43,9 @@ class Steady:
 
 
 def run_vpp2(root,arm,cameras,bank,guard,client,previous,after,settings):
+    if settings.get('execution_mode')=='h100_async_rtc':
+        from rtc_piper.vpp2_rtc import run_remote_rtc
+        return run_remote_rtc(root,arm,cameras,bank,guard,client,previous,after,settings)
     root=Path(root);smoother=CommandSmoother(previous,settings)
     now=time.monotonic();previous_time=now;stage='settle';stable=Steady()
     deadline=now+settings['settle_timeout_s'];hold=previous.copy()

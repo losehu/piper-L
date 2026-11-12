@@ -14,6 +14,6 @@
 
 本项目直接使用 RTC-Anything 的时间块缓存和官方 pyAgxArm 的 V189 协议实现。`rtc_piper/smoothing.py` 保留 Kai0 重叠平滑参考说明，并增加项目自己的三次位置/速度衔接；原参考源码、许可证和来源记录位于 `deployment/vendor/kai0_reference/`。
 
-VPP2 源码快照来自已准备的部署目录，包含本次 Piper 输入/动作适配所用实现。`deployment/vpp2_runtime/` 提供本地 INT8 装载、5步采样及可选动作去噪编译的模型服务；机械臂控制复用本项目的 V189 实现。
+VPP2 源码快照来自已准备的部署目录，包含本次 Piper 输入/动作适配所用实现。`deployment/vpp2_runtime/` 提供 INT8/BF16 装载及5步采样，`deployment/vpp2_network/` 提供单卡H100常驻、编译与CUDA graphs、无损图像传输及异步续块；机械臂控制复用本项目的 V189 实现。
 
 本仓库不包含预训练模型、微调权重或原始训练数据。模型及其基础组件的使用条款由相应发布方提供。

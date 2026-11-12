@@ -48,6 +48,10 @@ def stop_idle_other(root,selected,guard=None):
 
 
 def check_vpp2_assets(root,settings):
+    if settings.get('execution_mode')=='h100_async_rtc':
+        from rtc_piper.vpp2_client import Vpp2Client
+        client=Vpp2Client(settings);client.close()
+        return None,None
     root=Path(root).resolve();assets=Path(settings['vpp2_root'])
     python=assets/'.venv/bin/python'
     required=[python,assets/'config/train_config.yaml',assets/'weights/best_action.pt',
@@ -62,6 +66,7 @@ def check_vpp2_assets(root,settings):
 
 
 def start_vpp2(root,settings):
+    if settings.get('execution_mode')=='h100_async_rtc':raise RuntimeError('H100 bridge unavailable; local fallback is disabled')
     root=Path(root).resolve();assets,python=check_vpp2_assets(root,settings)
     argv=[str(python),'-u',str(root/'vpp2_runtime/server.py'),'--root',str(assets),
           '--backend','int8','--host','127.0.0.1','--port',str(settings['policy_port']),
@@ -85,6 +90,8 @@ def start_vpp2(root,settings):
 
 
 def stop_changed_vpp2(root,settings,guard=None):
+    if settings.get('execution_mode')=='h100_async_rtc':
+        return stop_idle_other(root,'pi05',guard)
     try:previous=json.loads((Path(root)/'logs/vpp2_service.json').read_text())
     except (OSError,ValueError):return
     if (bool(previous.get('compile_vpp2',False))!=settings.get('compile_vpp2',False)

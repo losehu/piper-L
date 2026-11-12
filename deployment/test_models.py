@@ -21,9 +21,14 @@ from rtc_piper.vpp2_control import run_vpp2
 ROOT=Path(__file__).resolve().parent
 
 
+def fixture_config(_path):
+    """Model-contract tests use portable defaults, independent of live mode."""
+    return config(ROOT/'config.example.yaml')
+
+
 class SelectionTests(unittest.TestCase):
     def test_models_keep_arm_protocol_but_select_different_action_shapes(self):
-        cfg=config(ROOT/'config.yaml')
+        cfg=fixture_config(ROOT/'config.yaml')
         pi=select_model(cfg,'pi05',ROOT);vpp=select_model(cfg,'vpp2',ROOT)
         self.assertEqual((pi['model_step'],pi['action_horizon'],pi['execution_mode']),(2500,50,'rtc'))
         self.assertEqual((vpp['model_step'],vpp['action_horizon'],vpp['execution_mode']),(2250,32,'plan_execute'))
@@ -33,7 +38,7 @@ class SelectionTests(unittest.TestCase):
         self.assertGreater(vpp['policy_timeout_s'],vpp['request_timeout_s']+32/30)
 
     def test_shape_is_strict_per_backend_and_outputs_keep_firmware_clipping(self):
-        cfg=select_model(config(ROOT/'config.yaml'),'vpp2',ROOT)
+        cfg=select_model(fixture_config(ROOT/'config.yaml'),'vpp2',ROOT)
         actions=np.zeros((32,7));actions[:,5]=np.radians(-190);actions[:,6]=.12
         out=validate_actions(actions,cfg)
         np.testing.assert_allclose(np.degrees(out[:,5]),-170)
@@ -42,7 +47,7 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):validate_actions(np.full((32,7),np.nan),cfg)
 
     def test_compile_only_changes_vpp2_compute_and_startup_budget(self):
-        cfg=config(ROOT/'config.yaml');normal=select_model(cfg,'vpp2',ROOT)
+        cfg=fixture_config(ROOT/'config.yaml');normal=select_model(cfg,'vpp2',ROOT)
         compiled=select_model(cfg,'vpp2',ROOT,compile_vpp2=True)
         self.assertTrue(compiled['compile_vpp2']);self.assertFalse(normal['compile_vpp2'])
         for key in ['fps','action_horizon','request_timeout_s','policy_command_lower_rad']:
@@ -50,7 +55,7 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):select_model(cfg,'pi05',ROOT,compile_vpp2=True)
 
     def test_vpp2_defaults_to_five_steps_with_explicit_ten_step_reference(self):
-        cfg=config(ROOT/'config.yaml');cfg['vpp2']={}
+        cfg=fixture_config(ROOT/'config.yaml');cfg['vpp2']={}
         self.assertEqual(select_model(cfg,'vpp2',ROOT)['denoising_steps'],5)
         cfg['vpp2']['denoising_steps']=10
         self.assertEqual(select_model(cfg,'vpp2',ROOT)['denoising_steps'],10)
@@ -58,7 +63,7 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):select_model(cfg,'vpp2',ROOT)
 
     def test_missing_vpp2_assets_never_stop_existing_model(self):
-        cfg=select_model(config(ROOT/'config.yaml'),'vpp2',ROOT)
+        cfg=select_model(fixture_config(ROOT/'config.yaml'),'vpp2',ROOT)
         with tempfile.TemporaryDirectory() as folder:
             cfg['vpp2_root']=folder
             with mock.patch('rtc_piper.hardware.follower_lock',return_value=nullcontext()), \
@@ -91,7 +96,7 @@ def fake_service():
             return result
     service=ThreadingHTTPServer(('127.0.0.1',0),Handler);service.policy=Policy()
     worker=threading.Thread(target=service.serve_forever,daemon=True);worker.start()
-    cfg=select_model(config(ROOT/'config.yaml'),'vpp2',ROOT);cfg['policy_port']=service.server_port
+    cfg=select_model(fixture_config(ROOT/'config.yaml'),'vpp2',ROOT);cfg['policy_port']=service.server_port
     try:yield cfg,service.policy
     finally:service.shutdown();service.server_close();worker.join(1)
 
@@ -172,7 +177,7 @@ class SlowPlanningTests(unittest.TestCase):
                 self.thread=mock.Mock();jobs.append(self)
                 self.thread.join.side_effect=lambda *_:self_test.assertEqual(guard.stop.value,1)
         self_test=self
-        cfg=select_model(config(ROOT/'config.yaml'),'vpp2',ROOT)
+        cfg=select_model(fixture_config(ROOT/'config.yaml'),'vpp2',ROOT)
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(control,'InferenceJob',Job), \
                 mock.patch.object(control.time,'monotonic',side_effect=lambda:clock[0]), \

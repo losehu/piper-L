@@ -21,6 +21,7 @@ assets/
 *.mcap
 /deployment/config.yaml
 /deployment/training_start_states.json
+/deployment/h100_runtime.json
 # Local environments and generated outputs
 .venv/
 venv/

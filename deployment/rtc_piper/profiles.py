@@ -12,6 +12,8 @@ def select_model(settings,name,root,compile_vpp2=None):
         return selected
     if name!='vpp2':raise ValueError('Model must be pi05 or vpp2')
     options=settings.get('vpp2',{})
+    if options.get('inference','local_sync') not in ('local_sync','h100_async_rtc'):raise ValueError('Invalid VPP2 inference mode')
+    remote=options.get('inference','local_sync')=='h100_async_rtc' or bool(os.environ.get('VPP2_REMOTE_PORT'))
     compiled=bool(options.get('torch_compile',False) if compile_vpp2 is None else compile_vpp2)
     steps=int(options.get('denoising_steps',5))
     if steps not in (5,10):raise ValueError('VPP2 denoising steps must be5 or10')
@@ -29,4 +31,11 @@ def select_model(settings,name,root,compile_vpp2=None):
         request_timeout_s=request,settle_timeout_s=settle,
         policy_timeout_s=request+settle+32/30+2,
         compile_vpp2=compiled,denoising_steps=steps,policy_startup_timeout_s=900 if compiled else 300)
+    if remote:
+        if steps!=5:raise ValueError('H100 asynchronous VPP2 uses5 denoising steps')
+        inflight=int(options.get('max_inflight',2))
+        if inflight not in (1,2):raise ValueError('VPP2 remote concurrency must be1 or2')
+        selected.update(execution_mode='h100_async_rtc',compile_vpp2=True,request_timeout_s=2.,
+            policy_timeout_s=32/30,vpp2_max_inflight=inflight,vpp2_startup_warmups=2,
+            vpp2_remote_port=int(os.environ.get('VPP2_REMOTE_PORT',options.get('remote_port',21969))))
     return selected

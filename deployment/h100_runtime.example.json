@@ -1,0 +1,16 @@
+{
+  "h100_ssh": "h100",
+  "robot_ssh": "arm@ROBOT_HOST",
+  "gpu": 0,
+  "cuda_graphs": true,
+  "compile_prefill": true,
+  "remote_deployment": "/path/to/piper_remote_deployment",
+  "remote_python": "/path/to/vpp2/.venv/bin/python",
+  "remote_assets": "/path/to/vpp2/deploy_piper",
+  "remote_sample": "/path/to/offline_sample.npz",
+  "remote_vendor_src": "/path/to/vendor/vpp2/src",
+  "remote_cache": "/path/to/inductor_cache",
+  "remote_port": 19868,
+  "local_forward_port": 21968,
+  "robot_forward_port": 21969
+}
