@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/OpenDriveLab/kai0",
+  "commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+  "path": "train_deploy_alignment/inference/agilex/inference/agilex_inference_openpi_rtc.py",
+  "sha256": "baa8f1bed9743fb8d1a5d27947c4cf11e9a8c5e64ebfcad901e1d14a4b64df6c",
+  "adaptation": "StreamActionBuffer old-to-new linear overlap, bounded4-step timed 7D transition, no old-tail padding"
+}

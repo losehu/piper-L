@@ -1,0 +1,8 @@
+numpy==1.26.4
+PyYAML==6.0.2
+python-can==4.5.0
+pyrealsense2==2.55.1.6486
+websockets==15.0.1
+msgpack==1.1.0
+Pillow==11.3.0
+typing-extensions==4.15.0

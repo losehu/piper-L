@@ -1,0 +1,83 @@
+{
+  "robot": "piper_l",
+  "firmware_driver": "v189",
+  "channel": "can1",
+  "adapter_serial": "SET_YOUR_USB_CAN_SERIAL",
+  "lock_file": "~/piper_calibration/.can1.lock",
+  "cameras": {
+    "cam0": "SET_EXTERNAL_CAMERA_SERIAL",
+    "cam1": "SET_WRIST_CAMERA_SERIAL"
+  },
+  "fps": 30,
+  "control_hz": 120,
+  "policy_port": 8000,
+  "execute_horizon": 18,
+  "max_observation_age_s": 0.25,
+  "policy_joint_speed_deg_s": [
+    60,
+    60,
+    60,
+    90,
+    90,
+    90
+  ],
+  "gripper_speed_m_s": 0.1,
+  "gripper_force_n": 0.5,
+  "prompt": "Pick up all the objects on the table and place them in the box.",
+  "hardware_limits_cache": {
+    "limits": [
+      {
+        "joint": 1,
+        "lower_deg": -150.0,
+        "upper_deg": 150.0,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      },
+      {
+        "joint": 2,
+        "lower_deg": 0.0,
+        "upper_deg": 180.0,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      },
+      {
+        "joint": 3,
+        "lower_deg": -170.0,
+        "upper_deg": 0.0,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      },
+      {
+        "joint": 4,
+        "lower_deg": -127.0,
+        "upper_deg": 127.0,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      },
+      {
+        "joint": 5,
+        "lower_deg": -89.5,
+        "upper_deg": 89.5,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      },
+      {
+        "joint": 6,
+        "lower_deg": -170.0,
+        "upper_deg": 170.0,
+        "max_speed_deg_s": 17.188733853924695,
+        "max_speed_rad_s": 0.3
+      }
+    ],
+    "query": "0x472 motor angle/speed read only, type1",
+    "query_frames_sent": 6,
+    "motion_enable_reset_gripper_frames_sent": 0
+  },
+  "hardware_limits_source": "Read live from can1 on every run/sensors startup; this cache is used only for offline checks. Never write hardware parameters.",
+  "chunk_smoothing_method": "cubic_velocity_bridge",
+  "chunk_smoothing_steps": 10,
+  "command_filter_tau_s": 0.04,
+  "model_step": 2500,
+  "checkpoint_index": 2499,
+  "checkpoint": "checkpoints/pi05_piper_2500_bf16"
+}

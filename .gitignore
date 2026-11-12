@@ -1,0 +1,47 @@
+# Private datasets, observations and learned artifacts
+artifacts/
+raw/
+selected/
+lerobot/
+checkpoints/
+assets/
+*.h5
+*.hdf5
+*.parquet
+*.npz
+*.npy
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.avi
+*.bag
+*.mcap
+/deployment/config.yaml
+/deployment/training_start_states.json
+# Local environments and generated outputs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+logs/
+cache/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+# Credentials and machine-local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+credentials.json
+.DS_Store

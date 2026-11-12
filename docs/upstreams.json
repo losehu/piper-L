@@ -1,0 +1,32 @@
+{
+  "deployment/vendor/openpi": {
+    "repository": "https://github.com/Physical-Intelligence/openpi",
+    "base_commit": "215abfb217dbac7d5f1273282331b9b1866c0479",
+    "license": "Apache-2.0; Gemma model terms retained in LICENSE_GEMMA.txt",
+    "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  },
+  "training/vendor/openpi": {
+    "repository": "https://github.com/Physical-Intelligence/openpi",
+    "base_commit": "215abfb217dbac7d5f1273282331b9b1866c0479",
+    "license": "Apache-2.0; Gemma model terms retained in LICENSE_GEMMA.txt",
+    "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  },
+  "deployment/vendor/RTC-Anything": {
+    "repository": "https://github.com/PEILAB-PhysAI/RTC-Anything",
+    "base_commit": "2c30047c13c4af3891a6628045f70b3da2eb15e0",
+    "license": "MIT",
+    "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  },
+  "deployment/vendor/pyAgxArm": {
+    "repository": "https://github.com/agilexrobotics/pyAgxArm",
+    "base_commit": "d90e234ba8e408cfa964b38aa9120b3131fc9f85",
+    "license": "LGPL-3.0-only",
+    "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  },
+  "deployment/vendor/kai0_reference": {
+    "repository": "https://github.com/OpenDriveLab/kai0",
+    "base_commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
+    "license": "Apache-2.0",
+    "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  }
+}

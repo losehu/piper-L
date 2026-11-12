@@ -1,0 +1,27 @@
+{
+  "source": "Current single-arm CLI deployment, snapshotted2026-11-12",
+  "training_updates": 2500,
+  "source_checkpoint_index": 2499,
+  "model_step": 2500,
+  "fps": 30,
+  "control_hz": 120,
+  "execute_horizon": 18,
+  "chunk_smoothing_method": "cubic_velocity_bridge",
+  "chunk_smoothing_steps": 10,
+  "command_filter_tau_s": 0.04,
+  "hardware": "Piper-L V189, can1 at1Mbps, two RealSense RGB views",
+  "portability_changes": [
+    "Example hardware IDs",
+    "Configurable shared lock path",
+    "Dynamic Linux user ID for X authority",
+    "Synthetic test start poses, no private recordings"
+  ],
+  "excluded": [
+    "training datasets",
+    "model checkpoints",
+    "offline observation images",
+    "demonstration start states",
+    "machine-private config",
+    "runtime logs"
+  ]
+}
