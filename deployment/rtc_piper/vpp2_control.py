@@ -1,8 +1,9 @@
-"""Stationary planning followed by30Hz VPP2 blocks, shared120Hz arm transport.
+"""Synchronous VPP2 chunks: finish, stop, observe, infer, then execute.
 
 The14B WAM is slower than its32-frame prediction window on this GPU. Waiting
 for a result therefore holds the arm; old observations are never relabelled as
-fresh RTC inputs, and inference never blocks the command/keyboard watchdogs.
+fresh RTC inputs. A worker keeps the hold/keyboard loop responsive, but there
+is no inference prefetch during chunk execution.
 """
 from collections import deque
 import json
@@ -47,10 +48,10 @@ def run_vpp2(root,arm,cameras,bank,guard,client,previous,after,settings):
     deadline=now+settings['settle_timeout_s'];hold=previous.copy()
     guard.startup_deadline.value=now+settings['settle_timeout_s']+settings['request_timeout_s']+2
     job=None;actions=None;execution_started=None;capture_after=after
-    stats=dict(requests=0,accepted_chunks=0,discarded_moved_plans=0,projected_chunks=0)
+    stats=dict(requests=0,accepted_chunks=0,completed_chunks=0,discarded_moved_plans=0,projected_chunks=0)
     events=deque(maxlen=256);history=deque(maxlen=1200);latencies=[]
     control_error=None;state=previous.copy();next_notice=0
-    print('VPP2：保持姿态等待推理，再按30Hz执行32帧；控制/急停持续120Hz。',flush=True)
+    print('VPP2同步模式：执行完整32帧→停稳保持→采集新观测→推理；控制/急停持续120Hz。',flush=True)
     try:
         while True:
             guard.check();cameras.check();arm.status(require_enabled=True)
@@ -60,13 +61,22 @@ def run_vpp2(root,arm,cameras,bank,guard,client,previous,after,settings):
             target=hold
             if stage=='settle':
                 settled=stable.update(state,stamps)
-                if (settled and observation is not None and observation.t>capture_after
+                if settled:
+                    # Images selected before this point can precede physical
+                    # stopping. Observe only after the held arm is stable.
+                    capture_after=now;stage='observe'
+                    events.append(dict(t=now,stage='stopped'))
+                elif now>deadline:raise RuntimeError('VPP2 waiting for stable arm timed out')
+            elif stage=='observe':
+                if now>deadline:raise RuntimeError('VPP2 waiting for a fresh stopped observation timed out')
+                if not stable.update(state,stamps):
+                    stage='settle';stable=Steady()
+                elif (observation is not None and observation.t>capture_after
                         and np.all(observation.state_times>capture_after)):
                     job=InferenceJob(client,observation,settings['prompt'])
                     infer_started=now;deadline=now+settings['request_timeout_s'];stage='infer'
                     stats['requests']+=1
                     events.append(dict(t=now,stage='infer',observed_at=observation.t))
-                elif now>deadline:raise RuntimeError('VPP2 waiting for stable arm and fresh camera observation timed out')
             elif stage=='infer':
                 if now>deadline:raise RuntimeError('VPP2 inference timed out while holding position')
                 if job.done.is_set():
@@ -100,9 +110,10 @@ def run_vpp2(root,arm,cameras,bank,guard,client,previous,after,settings):
                 frame=(now-execution_started)*30
                 if frame>=32:
                     hold=actions[-1].copy();target=hold
+                    stats['completed_chunks']+=1
                     stage='settle';stable=Steady();capture_after=now
                     deadline=now+settings['settle_timeout_s']
-                    events.append(dict(t=now,stage='settle'))
+                    events.append(dict(t=now,stage='chunk_complete'))
                 else:
                     index=math.floor(frame);right=min(index+1,31)
                     target=actions[index]+(actions[right]-actions[index])*(frame-index)

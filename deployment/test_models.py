@@ -151,7 +151,7 @@ class HttpContractTests(unittest.TestCase):
 
 
 class SlowPlanningTests(unittest.TestCase):
-    def invoke(self,delay,stop_at=14.5):
+    def invoke(self,delay,stop_at=14.5,observation_lag=0):
         import rtc_piper.vpp2_control as control
         clock=[10.];state=np.r_[np.zeros(6),.02];commands=[];jobs=[]
         def check():
@@ -163,7 +163,7 @@ class SlowPlanningTests(unittest.TestCase):
         def grip(value,force):state[6]=value
         arm=types.SimpleNamespace(joints=joints,grip=grip,status=lambda **_:None)
         bank=types.SimpleNamespace(live=lambda:(state.copy(),np.full(4,clock[0])),
-            observation=lambda:Observation(clock[0],state.copy(),{},np.full(4,clock[0])))
+            observation=lambda:Observation(clock[0]-observation_lag,state.copy(),{},np.full(4,clock[0]-observation_lag)))
         actions=np.tile(state,(32,1));actions[:,0]=np.linspace(0,.1,32)
         class Job:
             def __init__(self,client,observation,prompt):
@@ -201,6 +201,33 @@ class SlowPlanningTests(unittest.TestCase):
         self.assertEqual(report['stats']['accepted_chunks'],0)
         np.testing.assert_allclose([q for t,q in commands],0)
         self.assertEqual(guard.stop.value,1)
+
+    def test_next_request_waits_for_whole_chunk_and_physical_stop(self):
+        error,commands,jobs,report,guard=self.invoke(.4,stop_at=17.)
+        self.assertIn('operator stop',error);self.assertGreaterEqual(len(jobs),2)
+        events=report['recent_events'];playing=None;completed=None;stopped=None
+        for event in events:
+            if event['stage']=='play':playing=event['t'];completed=None;stopped=None
+            elif event['stage']=='chunk_complete':
+                self.assertIsNotNone(playing)
+                self.assertGreaterEqual(event['t']-playing,32/30)
+                completed=event['t'];playing=None
+            elif event['stage']=='stopped':stopped=event['t']
+            elif event['stage']=='infer':
+                self.assertIsNone(playing,'Inference must not overlap chunk playback')
+                self.assertIsNotNone(stopped)
+                self.assertGreater(event['observed_at'],stopped)
+                if completed is not None:self.assertGreater(stopped,completed)
+        self.assertGreaterEqual(report['stats']['completed_chunks'],1)
+
+    def test_frames_from_before_stopping_are_not_used_for_next_inference(self):
+        error,commands,jobs,report,guard=self.invoke(.4,stop_at=16.,observation_lag=.12)
+        stopped=[e['t'] for e in report['recent_events'] if e['stage']=='stopped']
+        self.assertGreaterEqual(len(jobs),2)
+        for job,stamp in zip(jobs,stopped):
+            self.assertGreater(job.observation.t,stamp)
+            self.assertTrue(np.all(job.observation.state_times>stamp))
+            self.assertGreater(job.started-stamp,.12)
 
 
 class ServiceOwnershipTests(unittest.TestCase):
