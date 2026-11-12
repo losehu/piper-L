@@ -50,6 +50,10 @@ cd deployment
 ./run.sh --model pi05
 # VPP2：先在连接 H100 的工作站运行桥接器，见部署说明；再在机械臂端：
 ./run_vpp2_h100.sh
+# π0.5 对比入口（默认2500、平滑+RTC的 run.sh 保留）：
+./run_pi05_1500.sh                  # 1500权重，保留平滑+RTC
+./run_pi05_no_smoothing.sh          # 2500权重，关闭块衔接和输出滤波，保留RTC
+./run_pi05_no_smoothing_no_rtc.sh   # 2500权重，无平滑，完整执行50帧后再推理
 ```
 
 **`run.sh` 在预检通过后会自动恢复、使能、低速对齐并开始动作，不再要求输入 RUN。** 全局 Space / Esc 或运行终端 Ctrl+C 触发独立进程的固件阻尼停止，不发送 Disable 卸力。固件恢复可能短暂失能，启动前应承托机械臂并清空对齐通路。
@@ -78,7 +82,7 @@ Kai0 的重叠替换思路用于部署端；三次速度衔接是本项目适配
 ```bash
 cd deployment
 cp -n config.example.yaml config.yaml
-.venv/bin/python -m unittest -q test_runtime test_models test_vpp2_rtc vpp2_network.test_transport
+.venv/bin/python -m unittest -q test_runtime test_models test_vpp2_rtc test_pi05_options vpp2_network.test_transport
 ```
 
 测试覆盖 CAN 编码、禁止卸力、固件限位裁剪、相机异步重试、动作过期、插值并发快照、速度衔接、输出滤波和权重身份选择，不启动真实机械臂。训练损失或离线回放结果不等于真机抓取成功率；最终 2500 权重与三次速度衔接组合的闭环效果需实机评估。

@@ -249,6 +249,9 @@ def run_policy(root, arm, cameras, bank, guard, client, previous, after, config)
     if config.get('model_name')=='vpp2':
         from rtc_piper.vpp2_control import run_vpp2
         return run_vpp2(root,arm,cameras,bank,guard,client,previous,after,config)
+    if config.get('execution_mode')=='sync_chunks':
+        from rtc_piper.pi05_sync import run_sync
+        return run_sync(root,arm,cameras,bank,guard,client,previous,after,config)
     # Entire capture and all four feedback groups must be from this new stage.
     while True:
         guard.check();cameras.check();arm.status(require_enabled=True)
@@ -285,8 +288,9 @@ def run_policy(root, arm, cameras, bank, guard, client, previous, after, config)
                 # Initialize its heartbeat before enabling watchdog running mode.
                 guard.policy_time.value=now
                 started=now;guard.running.value=1;previous_time=now
-                print('执行中：30Hz动作时间轴，120Hz插值；速度衔接%d帧，输出滤波τ=%.0fms；Space/Esc/Ctrl+C 阻尼停止。'%(
-                    config['chunk_smoothing_steps'],1000*config['command_filter_tau_s']),flush=True)
+                print('执行中：30Hz动作时间轴，120Hz插值；平滑%s；Space/Esc/Ctrl+C 阻尼停止。'%(
+                    '开启（衔接%d帧，滤波τ=%.0fms）'%(config['chunk_smoothing_steps'],1000*config['command_filter_tau_s'])
+                    if config.get('smoothing_enabled',True) else '关闭（保留固件限位与指令限速）'),flush=True)
             command=smoother.step(target,max(now-previous_time,1e-6))
             arm.joints(command[:6]);arm.grip(command[6],config['gripper_force_n'])
             previous=command;previous_time=now

@@ -4,13 +4,15 @@ from pathlib import Path
 import math
 
 
-def select_model(settings,name,root,compile_vpp2=None):
+def select_model(settings,name,root,compile_vpp2=None,pi05_step=None,no_smoothing=False,no_rtc=False):
     selected=dict(settings,model_name=name,action_horizon=50,policy_timeout_s=.8,
                   execution_mode='rtc',policy_startup_timeout_s=180)
     if name=='pi05':
         if compile_vpp2:raise ValueError('pi05 uses JAX; --compile is for VPP2 only')
-        return selected
+        from rtc_piper.pi05_options import execution_settings
+        return execution_settings(selected,pi05_step,no_smoothing,no_rtc)
     if name!='vpp2':raise ValueError('Model must be pi05 or vpp2')
+    if pi05_step is not None or no_smoothing or no_rtc:raise ValueError('These ablation options are for pi05 only')
     options=settings.get('vpp2',{})
     if options.get('inference','local_sync') not in ('local_sync','h100_async_rtc'):raise ValueError('Invalid VPP2 inference mode')
     remote=options.get('inference','local_sync')=='h100_async_rtc' or bool(os.environ.get('VPP2_REMOTE_PORT'))

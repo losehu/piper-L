@@ -72,8 +72,10 @@ class Timeline:
             generation=self.buffer.generation
         bootstrap=not self.has_prediction and self.initial_action is not None
         old_action=(lambda _:self.initial_action) if bootstrap else self.old.get_action
-        actions,blended=bridge_chunk(actions,cursor,(now-self.epoch)*30,old_action,
-                                    self.config['chunk_smoothing_steps'],self.config['execute_horizon'])
+        blended=0
+        if self.config.get('smoothing_enabled',True):
+            actions,blended=bridge_chunk(actions,cursor,(now-self.epoch)*30,old_action,
+                                        self.config['chunk_smoothing_steps'],self.config['execute_horizon'])
         # A cubic tangent correction can overshoot its endpoints. The same full
         # firmware command bounds apply after the splice, before any execution.
         bounded=validate_actions(actions,self.config)
@@ -294,6 +296,7 @@ class CommandSmoother:
         # Reusing the filtered position as the slew limiter origin each time
         # would accidentally slow every motion almost to a standstill.
         self.reference=limited_target(target,self.reference,dt,self.config)
+        if not self.config.get('smoothing_enabled',True):return self.reference.copy()
         command=self.filter.step(self.reference,dt)
         command[:6]=np.clip(command[:6],self.config['policy_command_lower_rad'],
                             self.config['policy_command_upper_rad'])

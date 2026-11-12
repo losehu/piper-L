@@ -20,6 +20,21 @@ def connected(port):
     return False
 
 
+def prepare_pi05(root,settings,guard=None):
+    """Caller owns the arm lock; only switch an idle, owned pi05 process."""
+    root=Path(root).resolve();checkpoint=root/settings['checkpoint']
+    if not (checkpoint/'params').is_dir() or not (checkpoint/'assets').is_dir():
+        raise RuntimeError('pi05 checkpoint assets missing: '+str(checkpoint))
+    try:state=json.loads((root/'logs/policy_state.json').read_text())
+    except (OSError,ValueError):return
+    if not process_args(state.get('pid')):return
+    metadata=state.get('metadata',{})
+    step=metadata.get('training_updates',state.get('training_updates'))
+    index=metadata.get('source_checkpoint_index',state.get('source_checkpoint_index'))
+    if (step,index)==(settings['model_step'],settings['checkpoint_index']):return
+    stop_idle_other(root,'vpp2',guard)
+
+
 def stop_idle_other(root,selected,guard=None):
     """Caller owns the shared arm lock. Unknown PIDs and other jobs are untouched."""
     root=Path(root).resolve()

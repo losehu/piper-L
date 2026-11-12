@@ -58,6 +58,9 @@ def ensure_policy(settings,guard=None,owns_hardware_lock=False):
     if kind=='vpp2':
         check_vpp2_assets(ROOT,settings)
         stop_changed_vpp2(ROOT,settings,guard)
+    else:
+        from rtc_piper.model_services import prepare_pi05
+        prepare_pi05(ROOT,settings,guard)
     stop_idle_other(ROOT,kind,guard)
     def connect():
         if guard:guard.check()
@@ -95,7 +98,7 @@ def ensure_policy(settings,guard=None,owns_hardware_lock=False):
     process=None
     if not alive:
         log=(ROOT/'logs/policy.log').open('a')
-        process=subprocess.Popen(['bash',str(ROOT/'start_policy.sh')],cwd=str(ROOT),
+        process=subprocess.Popen(['bash',str(ROOT/'start_policy.sh'),'--step',str(settings['model_step'])],cwd=str(ROOT),
                                  stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         log.close()
         print('正在本机加载π0.5模型，日志：',ROOT/'logs/policy.log',flush=True)
@@ -127,7 +130,7 @@ def _offline_check(settings):
             now=time.monotonic();obs=Observation(now,state,images,np.full(4,now))
             before=time.monotonic();actions=client.infer(obs,settings['prompt']);elapsed=time.monotonic()-before
             actions=validate_actions(actions,settings)
-            if settings.get('model_name')!='vpp2':
+            if settings.get('model_name')!='vpp2' and settings.get('execution_mode')!='sync_chunks':
                 timeline=Timeline(ROOT,settings,now)
                 timeline.enqueue(actions,now,time.monotonic())
                 if timeline.target(time.monotonic()) is None:raise RuntimeError('Empty RTC action prefix')
@@ -233,16 +236,21 @@ def main():
     parser.add_argument('--seconds',type=float,default=6)
     parser.add_argument('--model',type=str.lower,choices=['pi05','vpp2'],default='pi05')
     parser.add_argument('--compile',dest='compile_vpp2',action='store_const',const=True,default=None)
+    parser.add_argument('--pi05-step',type=int,choices=[1500,2500],default=None)
+    parser.add_argument('--no-smoothing',action='store_true',help='Disable chunk bridge and output filter, retain command limits')
+    parser.add_argument('--no-rtc',action='store_true',help='Execute all50 pi05 frames, then observe and infer; no prefetch')
     args=parser.parse_args();(ROOT/'logs').mkdir(exist_ok=True)
     os.environ.setdefault('DISPLAY',':0')
     os.environ.setdefault('XAUTHORITY','/run/user/%d/gdm/Xauthority'%os.getuid())
     from rtc_piper.profiles import select_model
-    settings=select_model(config(args.config),args.model,ROOT,compile_vpp2=args.compile_vpp2)
+    settings=select_model(config(args.config),args.model,ROOT,compile_vpp2=args.compile_vpp2,
+                          pi05_step=args.pi05_step,no_smoothing=args.no_smoothing,no_rtc=args.no_rtc)
     print('模型：%s，checkpoint=%d，%d帧，调度=%s。'%(
         settings['model_name'],settings['model_step'],settings['action_horizon'],settings['execution_mode']),flush=True)
     if settings['model_name']=='vpp2':
         print('VPP2采样：%d步，动作去噪torch.compile=%s。'%(
             settings['denoising_steps'],settings['compile_vpp2']),flush=True)
+    else:print('π0.5平滑：%s。'%('开启' if settings.get('smoothing_enabled',True) else '关闭（保留限位/限速）'),flush=True)
     if args.command=='check':offline_check(settings)
     elif args.command=='sensors':sensors(settings,args.seconds)
     else:execute(settings)

@@ -14,10 +14,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--step',type=int,choices=[1500,2500],default=2500)
     args = parser.parse_args()
     root = args.root.resolve()
     state_path = root / 'logs/policy_state.json'
-    state = dict(pid=os.getpid(), status='loading', hardware_opened=False)
+    from rtc_piper.pi05_options import CHECKPOINTS,checkpoint_settings
+    state = dict(pid=os.getpid(), status='loading', hardware_opened=False,
+                 training_updates=args.step,source_checkpoint_index=CHECKPOINTS[args.step][0])
 
     def write():
         temp = state_path.with_suffix('.tmp')
@@ -31,10 +34,7 @@ def main():
     from rtc_piper.model_adapter import training_config, PROMPT
     if jax.default_backend() != 'gpu':
         raise RuntimeError('Local GPU required; CPU fallback is refused')
-    settings=yaml.safe_load((root/'config.yaml').read_text())
-    if (settings['model_step']!=2500 or settings['checkpoint_index']!=2499
-            or settings['checkpoint']!='checkpoints/pi05_piper_2500_bf16'):
-        raise RuntimeError('Expected requested final2500-update checkpoint')
+    settings=checkpoint_settings(yaml.safe_load((root/'config.yaml').read_text()),args.step)
     checkpoint = root / settings['checkpoint']
     policy = policy_config.create_trained_policy(
         training_config(root), checkpoint, default_prompt=PROMPT,
