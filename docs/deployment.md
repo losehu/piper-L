@@ -188,3 +188,39 @@ PYTHONPATH=.:vendor/pyAgxArm:vendor/openpi/packages/openpi-client/src \
 ```
 
 回放重复保存的图像/状态，使用模拟采集时间并额外预留两帧相机延迟；报告不代表真实相机或抓取成功率。代码不打开CAN，但取得共享文件锁以避开真实控制。
+
+## 7. π0.5 + VLA-Corrector
+
+该变体固定使用原2500次更新的π0.5（检查点目录2499），冻结主干，只训练独立42.5M残差MLP。原 `run.sh`、1500/2500选择、无平滑对照以及VPP2入口保留。切回普通模型时，在共用CAN文件锁下仅释放本部署拥有且无客户端的Corrector服务，避免重复占显存。
+
+完整仓库运行时保留根目录的 `corrector/`；若复制到已有独立部署目录，将这个包复制为部署目录下的 `corrector/`。私有模型资产布局：
+
+```text
+deployment/
+  corrector/                          # 独立部署时复制的源码包
+  corrector_assets/pi05_2500_k5/
+    mlp.npz                           # 最佳Corrector权重，Git忽略
+    metadata.json                     # 模型身份、时间间隔、阈值及数值验证
+    norm_stats.json                   # 原π0.5训练归一化
+    normal_calibration.json
+```
+
+在机械臂机器的交互终端执行：
+
+```bash
+cd /home/arm/piper_pi05_rtc_cmd_20261112
+./check_pi05_corrector.sh --mode full       # 保存观测检查，不连接设备
+./run_pi05_corrector.sh --mode monitor      # 仅记录监控，不截断动作
+./run_pi05_corrector.sh --mode truncate     # 检测异常后截断并普通重规划
+./run_pi05_corrector.sh --mode full         # 截断并对恢复请求启用OGG
+```
+
+三条 `run` 命令各自会自动准备并开始动作，按需选一条运行；默认mode为monitor。沿用Space/Esc/Ctrl+C独立固件阻尼急停、固件限位、限速和原平滑。视觉异常走减速保持与恢复推理；故障、过期或真实失联仍走阻尼停止。
+
+Corrector服务仅监听 `127.0.0.1:8002`，使用原OpenPI模型环境，与控制进程分离。基础π0.5推理与Corrector都在机械臂机器GPU执行，运行时不依赖H100。启动前热身普通采样、引导采样、独立视觉编码器、残差预测及在线随机噪声分支；同输入/噪声的无引导输出必须复现原π0.5。原π0.5去噪仍为10步，OGG只用于异常后的单次恢复请求，在其中2步施加梯度。
+
+监控复用策略视觉特征，并通过独立客户端最多每秒10次补充观测。训练与在线都只使用外部、腕部两路有效相机，输入为512×2048视觉token。以实际采集时间对齐：预测未来5个30Hz动作帧（166.7ms）的潜特征变化；稀疏监控观测之间线性插值到目标时刻，间隔超过200ms时丢弃该比较，不重写时间戳。完全静止、没有可靠残差方向的比较被跳过，不向特征注入随机噪声。
+
+在线使用CAN指令发送后的时间记录实际下发指令，转换为训练使用的六轴delta＋绝对夹爪，再按原分位数归一化；不采用仿真脚本的默认绝对动作假设。稳健阈值采用窗口中位数/MAD、连续3次超限、迟滞和冷却。恢复时提升请求代次，废弃旧队列及在途旧结果；新预测必须使用异常之后的观测。
+
+诊断位于 `logs/corrector_policy.log`、`logs/corrector_policy_state.json`、`logs/corrector_offline_check.json` 和 `logs/last_corrector_run.json`。H100上的正常示范校准不代表实机误报率或恢复成功率；先用monitor确认实际场景表现，再对比truncate/full。

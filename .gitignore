@@ -22,6 +22,7 @@ assets/
 /deployment/config.yaml
 /deployment/training_start_states.json
 /deployment/h100_runtime.json
+/deployment/corrector_assets/
 # Local environments and generated outputs
 .venv/
 venv/

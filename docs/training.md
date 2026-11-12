@@ -91,3 +91,26 @@ training/vendor/openpi/.venv/bin/python tools/apply_bf16_delta_fast.py \
 ```
 
 两者都只处理 CPU 文件，不启动机械臂；快速路径需要使用与增量包对应的 BF16 基础权重。最终部署目录按 [部署说明](deployment.md) 放置。
+
+## VLA-Corrector 八卡训练
+
+复用既有π0.5/OpenPI环境、最终2500更新BF16检查点和转换好的LeRobot数据。不重新训练π0.5，也不将6段留出数据加入训练。使用与部署相同的冻结视觉编码器提取42,314帧：48段/37,581帧训练，6段/4,733帧留出；两路有效相机输出512×2048 token，缓存为float16，兼容BF16编码器输出。
+
+在H100上的完整仓库根目录运行，替换下面私有路径：
+
+```bash
+export PYTHONPATH="$PWD:$PWD/deployment:/path/to/openpi/src:/path/to/openpi/packages/openpi-client/src"
+/path/to/openpi/.venv/bin/python -u training/corrector_pipeline.py \
+  --run-root /path/to/new_corrector_run \
+  --checkpoint /path/to/pi05_2500_bf16 \
+  --data-root /path/to/lerobot \
+  --openpi-root /path/to/openpi --k-step 5
+```
+
+流水线先在CPU导出当前检查点的视觉子树，再将完整episode分配到8张GPU提取；已有完整episode缓存可复用。随后用8进程DDP训练原作者的残差MLP，batch512，每卡microbatch8、累积8次，BF16自动混合精度，AdamW学习率3e-4、weight decay1e-4、余弦退火、30轮、early-stop patience5。目标为潜特征残差的余弦方向误差。没有逐帧随机拆分训练/验证，也不跨episode构造时间配对。
+
+共用服务器时，提取进程的JAX显存上限设为每卡8%，训练PyTorch上限为10%；不终止其他GPU进程。每卡CPU亲和性最多8个逻辑核。共享任务竞争仍可能影响速度；八卡DDP性能由最慢rank决定。
+
+训练后自动将最佳MLP导出为JAX可加载的 `deploy/mlp.npz`，验证PyTorch/JAX前向及动作梯度一致性，再按10Hz监控采样路径回放留出轨迹，校准正常误触发阈值。`training/corrector_finish.py` 可单独完成已训练目录的导出/校准。该留出集同时用于选模和校准，因此不作为独立测试集宣称抓取提升。
+
+当前实际运行完成30轮，最佳第25轮，方向验证损失0.4516338671；权重保存在私有运行目录 `run_k5/best.pt`，部署使用 `deploy/`。参数量42,510,336，k=5即166.7ms。训练数据、视觉缓存、权重及归一化资产不随Git发布。

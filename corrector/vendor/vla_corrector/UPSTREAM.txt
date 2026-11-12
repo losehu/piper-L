@@ -1,0 +1,4 @@
+Source: https://github.com/ZJU-OmniAI/vla-corrector
+Commit: 927a06da8f00d7df483459e9039219e076c846de
+Files: src/siglip_dynamics/MLP.py and config.py, unchanged.
+License: Apache-2.0; see LICENSE.

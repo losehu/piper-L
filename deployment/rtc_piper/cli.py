@@ -48,7 +48,7 @@ def live_settings(settings):
 
 def ensure_policy(settings,guard=None,owns_hardware_lock=False):
     from rtc_piper.policy import Client
-    from rtc_piper.model_services import stop_idle_other,start_vpp2,check_vpp2_assets,stop_changed_vpp2
+    from rtc_piper.model_services import stop_idle_other,start_vpp2,check_vpp2_assets,stop_changed_vpp2,stop_idle_corrector
     from rtc_piper.vpp2_client import Vpp2Client
     if guard:guard.check()
     if not owns_hardware_lock:
@@ -61,6 +61,7 @@ def ensure_policy(settings,guard=None,owns_hardware_lock=False):
     else:
         from rtc_piper.model_services import prepare_pi05
         prepare_pi05(ROOT,settings,guard)
+    stop_idle_corrector(ROOT,guard)
     stop_idle_other(ROOT,kind,guard)
     def connect():
         if guard:guard.check()

@@ -20,6 +20,25 @@ def connected(port):
     return False
 
 
+def stop_idle_corrector(root,guard=None):
+    """Release only an idle, owned Corrector when choosing an ordinary model."""
+    root=Path(root).resolve()
+    try:state=json.loads((root/'logs/corrector_policy_state.json').read_text())
+    except (OSError,ValueError):return
+    args=process_args(state.get('pid'))
+    if not args:return
+    if (state.get('owner_root')!=str(root) or args!=state.get('argv')
+            or 'corrector.serve' not in args or str(root) not in args):
+        raise RuntimeError('Corrector PID identity changed; left it untouched')
+    if connected(state.get('port',8002)):raise RuntimeError('Corrector has a connected client; finish that session first')
+    if guard:guard.check()
+    os.kill(state['pid'],signal.SIGTERM);until=time.monotonic()+10
+    while process_args(state['pid']):
+        if guard:guard.check()
+        if time.monotonic()>until:raise RuntimeError('Idle Corrector service did not exit')
+        time.sleep(.05)
+
+
 def prepare_pi05(root,settings,guard=None):
     """Caller owns the arm lock; only switch an idle, owned pi05 process."""
     root=Path(root).resolve();checkpoint=root/settings['checkpoint']

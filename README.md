@@ -6,12 +6,15 @@
 
 VPP2 选择 **2250 检查点**、**5 步去噪**、32 帧动作。当前部署使用单卡 H100：视频/动作主干 BF16、编码器常驻 GPU，动作去噪和视频条件前向启用 `torch.compile` 与 CUDA graphs；CLIP FP16、VAE FP32 沿用参考实现。机械臂端通过两条错峰 HTTP 长连接异步请求，按实际图像采集时间跳过已过期前缀，在120Hz控制循环中持续衔接。原24GB显卡的本地 INT8 同步模式仍可显式选择。π0.5 的模型和控制参数保持不变。
 
+π0.5 另有可选 **VLA-Corrector** 入口：冻结现有2500权重，用原48段训练数据训练42.5M残差MLP，6段留出数据用于选模与正常轨迹校准。支持只监控、截断重规划、截断＋OGG三种模式；Corrector与推理均在机械臂机器的GPU执行。训练和提取使用8张H100，代码位于 `corrector/` 和 `training/corrector_*.py`。原入口默认保持原π0.5行为。
+
 ## 目录
 
 | 路径 | 内容 |
 | --- | --- |
 | [`deployment/`](deployment/) | 当前命令行控制器、模型服务、相机同步、阻尼急停、回归测试 |
 | [`training/`](training/) | 实际八卡训练配置、数据转换、训练归一化、固定留出集验证 |
+| [`corrector/`](corrector/) | JAX残差MLP、视觉监控、恢复引导及独立控制入口 |
 | [`preprocessing/`](preprocessing/) | 本次数据的首尾裁剪、第 76 段拆分、质量统计与筛选脚本 |
 | [`tools/`](tools/) | 环境安装、BF16 权重导出/增量恢复、私有运行资产生成 |
 | [`docs/`](docs/) | 训练和部署说明、上游版本与第三方许可证 |
@@ -54,6 +57,9 @@ cd deployment
 ./run_pi05_1500.sh                  # 1500权重，保留平滑+RTC
 ./run_pi05_no_smoothing.sh          # 2500权重，关闭块衔接和输出滤波，保留RTC
 ./run_pi05_no_smoothing_no_rtc.sh   # 2500权重，无平滑，完整执行50帧后再推理
+# π0.5 + Corrector，私有Corrector资产准备见部署说明：
+./run_pi05_corrector.sh --mode monitor
+./run_pi05_corrector.sh --mode full
 ```
 
 **`run.sh` 在预检通过后会自动恢复、使能、低速对齐并开始动作，不再要求输入 RUN。** 全局 Space / Esc 或运行终端 Ctrl+C 触发独立进程的固件阻尼停止，不发送 Disable 卸力。固件恢复可能短暂失能，启动前应承托机械臂并清空对齐通路。
@@ -82,7 +88,9 @@ Kai0 的重叠替换思路用于部署端；三次速度衔接是本项目适配
 ```bash
 cd deployment
 cp -n config.example.yaml config.yaml
-.venv/bin/python -m unittest -q test_runtime test_models test_vpp2_rtc test_pi05_options vpp2_network.test_transport
+PYTHONPATH=..:. .venv/bin/python -m unittest -q \
+  test_runtime test_models test_vpp2_rtc test_pi05_options \
+  vpp2_network.test_transport test_corrector
 ```
 
 测试覆盖 CAN 编码、禁止卸力、固件限位裁剪、相机异步重试、动作过期、插值并发快照、速度衔接、输出滤波和权重身份选择，不启动真实机械臂。训练损失或离线回放结果不等于真机抓取成功率；最终 2500 权重与三次速度衔接组合的闭环效果需实机评估。

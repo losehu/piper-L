@@ -34,5 +34,11 @@
     "base_commit": "a103a1e1784d3e45014549a82238894d3ed85959",
     "license": "MIT",
     "snapshot": "Source snapshot from the prepared Piper VPP2 deployment; .git, virtualenvs, data, weights, caches and media omitted"
+  },
+  "corrector/vendor/vla_corrector": {
+    "repository": "https://github.com/ZJU-OmniAI/vla-corrector",
+    "base_commit": "927a06da8f00d7df483459e9039219e076c846de",
+    "license": "Apache-2.0",
+    "snapshot": "Unmodified MLP.py, config.py, LICENSE and provenance; no data or learned artifacts"
   }
 }
