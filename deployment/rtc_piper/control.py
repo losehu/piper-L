@@ -246,6 +246,9 @@ def prepare(arm, cameras, bank, guard, starts, config):
 
 
 def run_policy(root, arm, cameras, bank, guard, client, previous, after, config):
+    if config.get('model_name')=='vpp2':
+        from rtc_piper.vpp2_control import run_vpp2
+        return run_vpp2(root,arm,cameras,bank,guard,client,previous,after,config)
     # Entire capture and all four feedback groups must be from this new stage.
     while True:
         guard.check();cameras.check();arm.status(require_enabled=True)

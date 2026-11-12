@@ -32,7 +32,7 @@ def damped_stop(channel):
     return dict(sent=sent, errors=errors, hardware_acknowledged=False)
 
 
-def supervisor(parent, flags, heartbeat, policy_time, startup_deadline, channel):
+def supervisor(parent, flags, heartbeat, policy_time, startup_deadline, channel,policy_timeout_s=.8):
     stop, armed, running, ready, closed, terminal_keys = flags
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_:setattr(stop, 'value', 1))
@@ -78,7 +78,7 @@ def supervisor(parent, flags, heartbeat, policy_time, startup_deadline, channel)
                 if now-heartbeat.value > .35:
                     reason = 'Control heartbeat timeout'
                     stop.value = 1
-                if running.value and now-policy_time.value > .8:
+                if running.value and now-policy_time.value > policy_timeout_s:
                     reason = 'Policy heartbeat timeout'
                     stop.value = 1
                 if not running.value and now > startup_deadline.value:
@@ -106,9 +106,11 @@ def supervisor(parent, flags, heartbeat, policy_time, startup_deadline, channel)
 
 
 class Guard:
-    def __init__(self, channel):
+    def __init__(self, channel,policy_timeout_s=.8):
         if channel != 'can1':
             raise ValueError('This deployment is bound to the verified follower can1')
+        if not .2<=policy_timeout_s<=60:raise ValueError('Invalid policy watchdog budget')
+        self.policy_timeout_s=float(policy_timeout_s)
         ctx = mp.get_context('spawn')
         self.flags = [ctx.RawValue('b', 0) for _ in range(6)]
         self.stop, self.armed, self.running, self.ready, self.closed, self.terminal_keys = self.flags
@@ -117,7 +119,7 @@ class Guard:
         self.startup_deadline = ctx.RawValue('d', float('inf'))
         self.process = ctx.Process(target=supervisor,
             args=(os.getpid(), self.flags, self.heartbeat, self.policy_time,
-                  self.startup_deadline, channel), daemon=False)
+                  self.startup_deadline, channel,self.policy_timeout_s), daemon=False)
 
     def start(self):
         self.process.start()

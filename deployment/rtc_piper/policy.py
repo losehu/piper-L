@@ -20,8 +20,9 @@ class ActionRejection(RuntimeError):
 
 def validate_actions(actions, config, diagnostics=None):
     actions = np.asarray(actions,dtype=float).copy()
-    if actions.shape != (50,7) or not np.isfinite(actions).all():
-        raise ActionRejection('Policy must return finite 50x7 actions',dict(shape=list(actions.shape)))
+    horizon=int(config.get('action_horizon',50))
+    if actions.shape != (horizon,7) or not np.isfinite(actions).all():
+        raise ActionRejection('Policy must return finite %dx7 actions'%horizon,dict(shape=list(actions.shape)))
     prefix = int(config['execute_horizon'])
     lower,upper = np.asarray(config['policy_command_lower_rad']),np.asarray(config['policy_command_upper_rad'])
     projected=np.clip(actions[:,:6],lower,upper)

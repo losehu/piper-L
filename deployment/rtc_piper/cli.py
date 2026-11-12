@@ -46,11 +46,22 @@ def live_settings(settings):
     return apply_hardware_limits(settings,readback)
 
 
-def ensure_policy(settings,guard=None):
+def ensure_policy(settings,guard=None,owns_hardware_lock=False):
     from rtc_piper.policy import Client
+    from rtc_piper.model_services import stop_idle_other,start_vpp2,check_vpp2_assets,stop_changed_vpp2
+    from rtc_piper.vpp2_client import Vpp2Client
+    if guard:guard.check()
+    if not owns_hardware_lock:
+        from rtc_piper.hardware import follower_lock
+        with follower_lock(settings):return ensure_policy(settings,guard,owns_hardware_lock=True)
+    kind=settings.get('model_name','pi05')
+    if kind=='vpp2':
+        check_vpp2_assets(ROOT,settings)
+        stop_changed_vpp2(ROOT,settings,guard)
+    stop_idle_other(ROOT,kind,guard)
     def connect():
         if guard:guard.check()
-        client=Client(settings)
+        client=Vpp2Client(settings) if kind=='vpp2' else Client(settings)
         try:
             if guard:guard.check()
         except BaseException:
@@ -58,6 +69,18 @@ def ensure_policy(settings,guard=None):
         return client
     try:return connect()
     except (OSError,TimeoutError):pass
+    if kind=='vpp2':
+        process=start_vpp2(ROOT,settings)
+        print('正在本机加载VPP2 INT8，日志：',ROOT/'logs/vpp2_policy.log',flush=True)
+        until=time.monotonic()+settings['policy_startup_timeout_s']
+        while time.monotonic()<until:
+            if guard:guard.check()
+            if process is not None and process.poll() is not None:
+                raise RuntimeError('VPP2 startup failed; inspect logs/vpp2_policy.log')
+            time.sleep(.5)
+            try:return connect()
+            except (OSError,TimeoutError):pass
+        raise RuntimeError('VPP2 startup timeout; inspect logs/vpp2_policy.log')
     state_path=ROOT/'logs/policy_state.json'
     state={}
     if state_path.exists():
@@ -88,21 +111,28 @@ def ensure_policy(settings,guard=None):
 
 
 def offline_check(settings):
+    from rtc_piper.hardware import follower_lock
+    with follower_lock(settings):return _offline_check(settings)
+
+
+def _offline_check(settings):
     from rtc_piper.observations import Observation
     from rtc_piper.policy import validate_actions, Timeline
-    client=ensure_policy(settings);durations=[]
+    client=ensure_policy(settings,owns_hardware_lock=True);durations=[]
     try:
         with np.load(ROOT/'offline_sample.npz',allow_pickle=False) as sample:
             state=np.array(sample['state']);images={k:np.array(sample[k]) for k in ['cam0','cam1']}
-        for index in range(10):
+        requests=1 if settings.get('model_name')=='vpp2' else 10
+        for index in range(requests):
             now=time.monotonic();obs=Observation(now,state,images,np.full(4,now))
             before=time.monotonic();actions=client.infer(obs,settings['prompt']);elapsed=time.monotonic()-before
             actions=validate_actions(actions,settings)
-            timeline=Timeline(ROOT,settings,now)
-            timeline.enqueue(actions,now,time.monotonic())
-            if timeline.target(time.monotonic()) is None:raise RuntimeError('Empty RTC action prefix')
+            if settings.get('model_name')!='vpp2':
+                timeline=Timeline(ROOT,settings,now)
+                timeline.enqueue(actions,now,time.monotonic())
+                if timeline.target(time.monotonic()) is None:raise RuntimeError('Empty RTC action prefix')
             durations.append(elapsed)
-        result=dict(status='passed',requests=10,action_shape=[50,7],
+        result=dict(status='passed',requests=requests,action_shape=[settings.get('action_horizon',50),7],
                     p50_s=float(np.median(durations)),p95_s=float(np.percentile(durations,95)),
                     metadata=client.metadata,hardware_opened=False)
         (ROOT/'logs/offline_check.json').write_text(json.dumps(result,indent=2)+'\n')
@@ -154,7 +184,7 @@ def execute(settings):
     from rtc_piper.policy import Client
     from rtc_piper.safety import Guard,terminal_mode
     from rtc_piper.control import wait_ready,choose_start,prepare,run_policy
-    guard=Guard(settings['channel']);arm=cameras=lock=client=None
+    guard=Guard(settings['channel'],policy_timeout_s=settings.get('policy_timeout_s',.8));arm=cameras=lock=client=None
     def signal_stop(*_):
         guard.stop.value=1
         if not guard.armed.value:raise KeyboardInterrupt
@@ -162,9 +192,9 @@ def execute(settings):
     try:
         guard.start()
         print('自动执行模式：预检通过即开始动作；Space/Esc/Ctrl+C 可取消或阻尼停止。',flush=True)
-        client=ensure_policy(settings,guard=guard)
-        guard.check()
         candidate=follower_lock(settings);candidate.__enter__();lock=candidate
+        client=ensure_policy(settings,guard=guard,owns_hardware_lock=True)
+        guard.check()
         check_interface(settings);settings=live_settings(settings)
         bank=CaptureBank();arm=SdkArm(settings,bank,guard)
         cameras=RealSense(settings,bank)
@@ -197,14 +227,22 @@ def execute(settings):
 
 
 def main():
-    parser=argparse.ArgumentParser(description='RTC-Anything / Piper-L / π0.5 command-line deployment')
+    parser=argparse.ArgumentParser(description='Piper-L / pi05 or vpp2 local command-line deployment')
     parser.add_argument('command',choices=['check','sensors','run'],nargs='?',default='check')
     parser.add_argument('--config',default=str(ROOT/'config.yaml'))
     parser.add_argument('--seconds',type=float,default=6)
+    parser.add_argument('--model',type=str.lower,choices=['pi05','vpp2'],default='pi05')
+    parser.add_argument('--compile',dest='compile_vpp2',action='store_const',const=True,default=None)
     args=parser.parse_args();(ROOT/'logs').mkdir(exist_ok=True)
     os.environ.setdefault('DISPLAY',':0')
     os.environ.setdefault('XAUTHORITY','/run/user/%d/gdm/Xauthority'%os.getuid())
-    settings=config(args.config)
+    from rtc_piper.profiles import select_model
+    settings=select_model(config(args.config),args.model,ROOT,compile_vpp2=args.compile_vpp2)
+    print('模型：%s，checkpoint=%d，%d帧，调度=%s。'%(
+        settings['model_name'],settings['model_step'],settings['action_horizon'],settings['execution_mode']),flush=True)
+    if settings['model_name']=='vpp2':
+        print('VPP2采样：%d步，动作去噪torch.compile=%s。'%(
+            settings['denoising_steps'],settings['compile_vpp2']),flush=True)
     if args.command=='check':offline_check(settings)
     elif args.command=='sensors':sensors(settings,args.seconds)
     else:execute(settings)

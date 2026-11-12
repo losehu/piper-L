@@ -45,6 +45,11 @@ training/vendor/openpi/.venv/bin/python tools/export_runtime_assets.py \
 ```bash
 cd deployment
 ./run.sh
+# 等同于 ./run.sh --model pi05
+# 使用 VPP2：
+./run.sh --model vpp2
+# 使用 VPP2 + 动作去噪编译：
+./run.sh --model vpp2 --compile
 ```
 
 此命令会自动加载本机模型、完成 CAN/相机预检、恢复固件急停、保持当前姿态使能、以 5°/s 对齐示范起点，然后进入高跟随策略执行。准备阶段不动夹爪。启动前应承托机械臂并清空对齐通路。
@@ -73,4 +78,40 @@ Space、Esc 或 Ctrl+C 会锁定停止并由独立进程发送 `0x150/01` 阻尼
 ./check.sh
 ```
 
-模型服务本身只监听 `127.0.0.1:8000`，不直接操作 CAN 或相机。
+π0.5 模型服务只监听 `127.0.0.1:8000`，不直接操作 CAN 或相机。
+
+## 5. VPP2 私有资产与执行方式
+
+把 `config.yaml` 的 `vpp2.root` 指向已准备好的 VPP2 私有资产目录；也可用 `VPP2_DEPLOY_ROOT` 指定。其目录结构为：
+
+```text
+vpp2-assets/
+  .venv/bin/python                     # 独立 Python3.11 / torch2.7.1+cu128
+  config/train_config.yaml
+  weights/best_action.pt               # 已选2250检查点
+  weights/video_int8.safetensors
+  weights/video_int8_manifest.json
+  weights/Wan2.1-I2V-14B-480P/
+    Wan2.1_VAE.pth
+    models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+  assets/dataset_stats.json
+  assets/text_context.pt
+```
+
+独立环境依赖见 `deployment/vpp2_runtime/requirements.txt`，VPP2 源码固定在 `deployment/vendor/vpp2`。当前 .102 部署复用已准备好的环境、2250 权重、训练归一化和文本缓存，不重新下载训练数据。模型计算全部在 .102。
+
+默认 `vpp2.denoising_steps=5`，显式设成 `10` 可复现旧采样设置；只影响 VPP2。`vpp2.torch_compile` 默认 false，`--compile` 可启用。编译目标是 `MoT.forward_action_with_video_cache`，关闭 CUDA graphs 以控制24GB显存占用；没有编译整个视频主干。首次编译在读取保存的观测热身时完成，成功前不会进入机械臂使能阶段。
+
+VPP2 服务监听 `127.0.0.1:8768`。启动器在持有共享 CAN 文件锁后，只释放本部署拥有的空闲模型服务，避免两种模型同时占用显存；其他程序或有连接的模型不被结束。编译设置或采样步数变化时重新加载本部署的 VPP2 服务。服务和响应均核对2250身份、采样步数、动作单位、32×7形状及请求编号。
+
+VPP2 接收原始640×480双目RGB，复现训练时224×168缩放和上下黑边，再横向拼接。服务已把关节 delta 还原成绝对弧度，控制端不再次加当前状态；夹爪为绝对米。视频主干权重使用 INT8 存储并临时还原 BF16 运算，动作专家 BF16，CLIP/VAE 分阶段上显卡。
+
+当前调度为 `plan_execute`：保持姿态稳定至少300ms，使用新观测推理，再以30Hz执行32帧、120Hz插值与滤波，完成后重复。推理期间120Hz保持命令和独立键盘急停继续工作；超时、固件故障或控制心跳异常仍停止。块间会等待，不能用过期动作块来填补计算时间。VPP2 闭环抓取尚未验证。
+
+只做保存观测推理、不打开 CAN 或相机：
+
+```bash
+./check.sh --model vpp2 --compile
+```
+
+该检查会加载模型并占用GPU和共享文件锁，不能与其他控制程序同时运行。

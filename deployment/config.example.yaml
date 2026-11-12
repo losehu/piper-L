@@ -79,5 +79,13 @@
   "command_filter_tau_s": 0.04,
   "model_step": 2500,
   "checkpoint_index": 2499,
-  "checkpoint": "checkpoints/pi05_piper_2500_bf16"
+  "checkpoint": "checkpoints/pi05_piper_2500_bf16",
+  "vpp2": {
+    "root": "../artifacts/vpp2",
+    "port": 8768,
+    "request_timeout_s": 15,
+    "settle_timeout_s": 5,
+    "denoising_steps": 5,
+    "torch_compile": false
+  }
 }

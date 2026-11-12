@@ -28,5 +28,11 @@
     "base_commit": "9d93078c757840f50e75248c5c5a94ab7b41e13a",
     "license": "Apache-2.0",
     "snapshot": "Actual machine source snapshot; .git, virtualenvs, caches, build outputs and upstream media assets omitted"
+  },
+  "deployment/vendor/vpp2": {
+    "repository": "https://github.com/roboterax/video-prediction-policy-2.git",
+    "base_commit": "a103a1e1784d3e45014549a82238894d3ed85959",
+    "license": "MIT",
+    "snapshot": "Source snapshot from the prepared Piper VPP2 deployment; .git, virtualenvs, data, weights, caches and media omitted"
   }
 }
