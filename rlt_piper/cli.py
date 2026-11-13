@@ -46,8 +46,11 @@ def start(directory,stage,guard=None):
     except BaseException:stop(process);raise
 
 def train(directory):
-    subprocess.run([str(ROOT/'vendor/openpi/.venv/bin/python'),'-u','-m','rlt_piper.learn','--root',str(ROOT),'--assets',str(directory)],
-                   cwd=ROOT,env=environment(),check=True)
+    from rtc_piper.hardware import follower_lock
+    from rtc_piper.cli import config
+    with follower_lock(config(ROOT/'config.yaml')):
+        subprocess.run([str(ROOT/'vendor/openpi/.venv/bin/python'),'-u','-m','rlt_piper.learn','--root',str(ROOT),'--assets',str(directory)],
+                       cwd=ROOT,env=environment(),check=True)
 
 def check(directory,stage,settings):
     from rtc_piper.hardware import follower_lock
@@ -138,8 +141,7 @@ def main():
         if any(settings.get(k)!=v for k,v in trained.items()):raise RuntimeError('RLT actor RTC/filter settings do not match this execution')
     (ROOT/'logs').mkdir(exist_ok=True)
     if a.command=='train':
-        from rtc_piper.hardware import follower_lock
-        with follower_lock(settings):train(directory)
+        train(directory)
     elif a.command=='check':check(directory,a.stage,settings)
     else:execute(directory,a.stage,settings,not a.no_train and a.stage!='eval')
 
