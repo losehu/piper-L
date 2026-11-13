@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/Yyshadow/openpi-RLT",
+  "commit": "c1e40ac360185778c98cf20da2820e22d2d415e7",
+  "files": "Unmodified RL Token and online RL core; robot adapter is project-specific."
+}
