@@ -5,7 +5,7 @@ from rtc_piper.observations import NotReady
 from rtc_piper.policy import Timeline,CommandSmoother
 from rtc_piper.control import check_state
 
-def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,handover=None,leader=None):
+def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,handover=None,leader=None,ui=None):
     from rlt_piper.hil import Handover
     h=handover or Handover();h.after=after
     while True:
@@ -37,7 +37,7 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
         except BaseException as e:
             if not stop.is_set():errors.append(repr(e));guard.stop.value=1
     thread=threading.Thread(target=infer,daemon=True);thread.start()
-    started=False;previous_time=time.monotonic();next_report=0
+    started=False;previous_time=time.monotonic();next_report=0;next_ui=0
     guard.startup_deadline.value=time.monotonic()+3
     try:
         while True:
@@ -75,6 +75,11 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
                 actual=np.r_[np.rint(np.degrees(command[:6])*1000)*np.pi/180000,np.rint(command[6]*1e6)/1e6]
                 recorder.command(time.monotonic(),actual,source,h.generation,raw_leader,leader_times)
             previous=command;previous_time=now
+            if ui and now>=next_ui:
+                ui.update(phase='running',source='human' if h.mode=='human' else active_source,
+                    rtt_ms=float(1000*np.median(rtts)) if rtts else None,learner=learner_status,
+                    joint_deg=np.degrees(measured[:6]).tolist(),gripper_mm=float(measured[6]*1000))
+                next_ui=now+.1
             if now>=next_report:
                 print('RLT + RTC + 平滑；%s；RTT=%.0fms；训练=%s step=%s；I接管/交还 S成功/F失败 Space/Esc/Ctrl+C阻尼停止。'%(
                     h.mode+'/'+active_source,1000*np.median(rtts) if rtts else 0,learner_status.get('status','off'),learner_status.get('global_step',0)),flush=True)

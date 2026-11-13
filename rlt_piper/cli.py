@@ -85,13 +85,16 @@ def execute(directory,stage,settings,learn,leader_config):
     from rlt_piper.recording import Recorder
     from rlt_piper.labels import Labels
     guard=Guard(settings['channel'],policy_timeout_s=.8);process=policy=arm=cameras=labels=recorder=lock=None
-    terminal=None;error=None;leader=None
+    terminal=None;error=None;leader=None;ui=None
     def signal_stop(*_):
         guard.stop.value=1
         if not guard.armed.value:raise KeyboardInterrupt
     old={sig:signal.signal(sig,signal_stop) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
     try:
         candidate=follower_lock(settings);candidate.__enter__();lock=candidate
+        from rlt_piper.ui_bridge import Endpoint
+        ui=Endpoint.from_environment(guard)
+        if ui:ui.start()
         guard.start();process=start(directory,stage,guard,learn=learn);policy=Client(stage)
         if stage=='online' and not policy.metadata['rlt_actor_version']:
             print('BASE WARMUP：当前由冻结π0.5控制；回放和BC预热完成后才在新chunk启用actor。',flush=True)
@@ -105,10 +108,12 @@ def execute(directory,stage,settings,learn,leader_config):
         print('RLT stage=%s，Corrector关闭；自动准备起点%d。I人工接管/交还；S成功/F失败结束并阻尼停止；Space/Esc/Ctrl+C急停。'%(stage,row),flush=True)
         print('固件恢复可能短暂失能，请承托机械臂并清空对齐通路。',flush=True)
         recorder=Recorder(ROOT,stage,policy.metadata['rlt_token_sha256'],settings);recorder.start()
+        if ui:ui.attach(recorder,handover,bank);ui.update(phase='preparing')
         with terminal_mode(guard):
             after,previous=prepare(arm,cameras,bank,guard,starts,settings)
             labels=Labels(recorder,guard,handover);labels.start()
-            try:run(ROOT,arm,cameras,bank,guard,policy,previous,after,settings,recorder,handover,leader)
+            if ui:ui.update(phase='running',ready=True)
+            try:run(ROOT,arm,cameras,bank,guard,policy,previous,after,settings,recorder,handover,leader,ui=ui)
             except RuntimeError as e:
                 if (recorder.label is None or recorder.error or str(e)!='Emergency stop latched or independent guard unavailable'):
                     recorder.label=None;error=repr(e);raise
@@ -122,7 +127,9 @@ def execute(directory,stage,settings,learn,leader_config):
                         terminal=dict(t=obs.t,**{k:result['rlt'][k] for k in ['z_rl','proprio','ref_chunk']})
                     except Exception as e:error=str(e)
     finally:
-        try:guard.close()
+        try:
+            if ui:ui.close()
+            guard.close()
         finally:
             try:
                 if labels:labels.close()
