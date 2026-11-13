@@ -19,7 +19,9 @@ class Client:
         from websockets.sync.client import connect
         from openpi_client import msgpack_numpy
         self.codec=msgpack_numpy;self.session=session
-        self.ws=connect('ws://127.0.0.1:%d'%port,compression=None,max_size=8*1024**2,open_timeout=3,close_timeout=.2,ping_interval=None)
+        # This service is strictly local. websockets15 otherwise discovers
+        # desktop proxy settings, which can fail before cold startup is tried.
+        self.ws=connect('ws://127.0.0.1:%d'%port,proxy=None,compression=None,max_size=8*1024**2,open_timeout=3,close_timeout=.2,ping_interval=None)
         self.metadata=self.codec.unpackb(self.ws.recv(timeout=3))
         if (self.metadata.get('protocol')!=VERSION or self.metadata.get('training_updates')!=2500
             or self.metadata.get('source_checkpoint_index')!=2499 or self.metadata.get('action_horizon')!=50

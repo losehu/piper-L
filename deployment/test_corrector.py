@@ -2,7 +2,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import numpy as np
@@ -132,6 +134,43 @@ class ServiceOwnershipTests(unittest.TestCase):
             root=Path(folder);args=self.setup_state(root)
             with mock.patch.object(service,'process_args',side_effect=[args,[]]),mock.patch.object(service,'connected',return_value=False),mock.patch.object(service.os,'kill') as kill:
                 service.stop_idle_corrector(root);kill.assert_called_once_with(12345,service.signal.SIGTERM)
+
+
+class LoopbackConnectionTests(unittest.TestCase):
+    def test_local_corrector_connects_even_when_desktop_proxies_reject_connections(self):
+        from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+        from websockets.sync.server import serve
+        from websockets.exceptions import ConnectionClosed
+        from openpi_client import msgpack_numpy
+        from corrector.client import Client,Session
+        class RejectingProxy(BaseHTTPRequestHandler):
+            def do_CONNECT(self):
+                self.server.hits+=1;self.send_error(502,'Test proxy rejects local connections')
+            def log_message(self,*args):pass
+        metadata=dict(protocol=VERSION,training_updates=2500,source_checkpoint_index=2499,
+                      action_horizon=50,physical_action_dim=7,warmed_up=True,robot_connected=False)
+        def handler(ws):
+            ws.send(msgpack_numpy.packb(metadata))
+            try:ws.recv()
+            except ConnectionClosed:pass
+        with ThreadingHTTPServer(('127.0.0.1',0),RejectingProxy) as proxy, \
+                serve(handler,'127.0.0.1',0) as server:
+            proxy.hits=0
+            threads=[threading.Thread(target=proxy.serve_forever,daemon=True),
+                     threading.Thread(target=server.serve_forever,daemon=True)]
+            for thread in threads:thread.start()
+            url='http://127.0.0.1:%d'%proxy.server_port
+            env={key:url for key in ('http_proxy','https_proxy','all_proxy','ws_proxy','wss_proxy')}
+            env['no_proxy']=''
+            try:
+                with mock.patch.dict(os.environ,env,clear=True):
+                    client=Client(server.socket.getsockname()[1],Session('full'))
+                    try:self.assertEqual(client.metadata,metadata)
+                    finally:client.close()
+                self.assertEqual(proxy.hits,0)
+            finally:
+                server.shutdown();proxy.shutdown()
+                for thread in threads:thread.join(2)
 
 
 if __name__=='__main__':unittest.main()
