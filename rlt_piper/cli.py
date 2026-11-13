@@ -94,7 +94,7 @@ def execute(directory,stage,settings,learn):
         state,stamps,code,enabled,obs=wait_ready(arm,cameras,bank,guard)
         if code==0 and any(enabled):raise RuntimeError('Arm already enabled by another session')
         starts=json.loads((ROOT/'training_start_states.json').read_text());row,target=choose_start(state,starts,settings)
-        print('RLT stage=%s，Corrector关闭；自动准备起点%d。F8成功/F9失败结束并阻尼停止；Space/Esc/Ctrl+C急停。'%(stage,row),flush=True)
+        print('RLT stage=%s，Corrector关闭；自动准备起点%d。S成功/F失败结束并阻尼停止；Space/Esc/Ctrl+C急停。'%(stage,row),flush=True)
         print('固件恢复可能短暂失能，请承托机械臂并清空对齐通路。',flush=True)
         recorder=Recorder(ROOT,stage,policy.metadata['rlt_token_sha256'],settings)
         with terminal_mode(guard):

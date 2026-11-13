@@ -46,7 +46,7 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder):
             if started:arm.grip(command[6],settings['gripper_force_n'])
             recorder.command(time.monotonic(),command);previous=command;previous_time=now
             if now>=next_report:
-                print('RLT + RTC + 平滑，Corrector关闭；RTT=%.0fms；F8成功/F9失败，Space/Esc/Ctrl+C阻尼停止。'%(1000*np.median(rtts) if rtts else 0),flush=True)
+                print('RLT + RTC + 平滑，Corrector关闭；RTT=%.0fms；S成功/F失败，Space/Esc/Ctrl+C阻尼停止。'%(1000*np.median(rtts) if rtts else 0),flush=True)
                 next_report=now+2
             time.sleep(max(0,1/120-(time.monotonic()-now)))
     finally:

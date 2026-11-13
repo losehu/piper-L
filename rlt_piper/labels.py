@@ -1,4 +1,4 @@
-"""F8/F9 outcome reader; independent of the unchanged damping stop supervisor."""
+"""S/F outcome reader; independent of the unchanged damping stop supervisor."""
 import ctypes,ctypes.util,os,threading,time
 
 class Labels:
@@ -15,8 +15,8 @@ class Labels:
             lib.XCloseDisplay.argtypes=[ctypes.c_void_p]
             display=lib.XOpenDisplay(os.environ.get('DISPLAY',':0').encode())
             if not display:raise RuntimeError('Cannot open X display')
-            codes=[int(lib.XKeysymToKeycode(display,k)) for k in (0xFFC5,0xFFC6)]
-            if not all(codes):raise RuntimeError('F8/F9 key mapping unavailable')
+            codes=[int(lib.XKeysymToKeycode(display,k)) for k in (0x73,0x66)]
+            if not all(codes):raise RuntimeError('S/F key mapping unavailable')
             last=None
             while not self.stop.is_set():
                 bits=ctypes.create_string_buffer(32)
