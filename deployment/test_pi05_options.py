@@ -20,6 +20,27 @@ def selected(**kwargs):return select_model(config(ROOT/'config.example.yaml'),'p
 
 
 class OptionsTests(unittest.TestCase):
+    def test_pi05_smoothing_tuning_is_shared_with_corrector_but_isolated_from_vpp2(self):
+        base=config(ROOT/'config.example.yaml');unchanged=json.dumps(base,sort_keys=True)
+        pi=select_model(base,'pi05',ROOT)
+        vpp=select_model(base,'vpp2',ROOT)
+        self.assertEqual((pi['chunk_smoothing_steps'],pi['command_filter_tau_s']),(12,.05))
+        self.assertEqual((vpp['chunk_smoothing_steps'],vpp['command_filter_tau_s']),(10,.04))
+        self.assertEqual(json.dumps(base,sort_keys=True),unchanged)
+        disabled=select_model(base,'pi05',ROOT,no_smoothing=True)
+        self.assertFalse(disabled['smoothing_enabled'])
+        legacy=dict(base);legacy.pop('pi05')
+        old=select_model(legacy,'pi05',ROOT)
+        self.assertEqual((old['chunk_smoothing_steps'],old['command_filter_tau_s']),(10,.04))
+
+    def test_pi05_tuning_rejects_invalid_values_before_hardware(self):
+        base=config(ROOT/'config.example.yaml')
+        for key,values in [('chunk_smoothing_steps',[True,0,19,2.5]),
+                           ('command_filter_tau_s',[True,0,.3,float('nan'),float('inf'),'0.05'])]:
+            for value in values:
+                with self.subTest(key=key,value=value),self.assertRaisesRegex(ValueError,'pi05'):
+                    select_model(dict(base,pi05={key:value}),'pi05',ROOT)
+
     def test_explicit1500_and_default2500_have_distinct_verified_identities(self):
         default=selected();old=selected(pi05_step=1500)
         self.assertEqual((default['model_step'],default['checkpoint_index']),(2500,2499))

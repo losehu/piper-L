@@ -80,6 +80,10 @@
   "model_step": 2500,
   "checkpoint_index": 2499,
   "checkpoint": "checkpoints/pi05_piper_2500_bf16",
+  "pi05": {
+    "chunk_smoothing_steps": 12,
+    "command_filter_tau_s": 0.05
+  },
   "vpp2": {
     "root": "../artifacts/vpp2",
     "port": 8768,
