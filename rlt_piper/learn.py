@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 from rlt_piper.contract import assets,upstream,normalize,SCHEMA,CHUNK,digest
 from rlt_piper.recording import transitions
+from rlt_piper.checkpoint import current,publish
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--assets',type=Path,required=True)
@@ -30,10 +31,11 @@ def main():
                           warmup_min_size=600,warmup_post_collect_updates=2000,fixed_std=.05)
     # Upstream state serialization expects the portable uint32 PRNG key format.
     state,actor,critic=init_train_state(cfg,rng=jax.random.PRNGKey(42));previous=[]
-    if (a.assets/'learner.msgpack').exists():
-        prior=json.loads((a.assets/'actor.json').read_text())
+    checkpoint=current(a.assets)
+    if (checkpoint/'learner.msgpack').exists():
+        prior=json.loads((checkpoint/'actor.json').read_text())
         if prior['token_sha256']!=meta['token_sha256']:raise RuntimeError('Learner/token lineage changed')
-        state=serialization.from_bytes(state,(a.assets/'learner.msgpack').read_bytes());previous=prior['episodes']
+        state=serialization.from_bytes(state,(checkpoint/'learner.msgpack').read_bytes());previous=prior['episodes']
         if prior['execution_settings']!=settings:raise RuntimeError('Learner execution configuration changed')
     if set(episodes)<=set(previous):
         print(json.dumps(dict(status='no_new_labelled_episodes',episodes=len(episodes))),flush=True);return
@@ -54,13 +56,11 @@ def main():
     if not all(np.isfinite(float(v)) for v in metrics.values()):raise RuntimeError('Nonfinite final RLT metrics')
     state=jax.tree.map(lambda x:np.asarray(x),state);version=int(state.actor_version)
     payload=dict(version=version,actor_params=state.actor_params,rl_config=dataclasses.asdict(cfg),token_sha256=meta['token_sha256'])
-    for name,value in [('learner.msgpack',serialization.to_bytes(state)),('actor.pkl',pickle.dumps(payload,protocol=5))]:
-        temp=a.assets/(name+'.partial');temp.write_bytes(value);temp.replace(a.assets/name)
     info=dict(schema=SCHEMA,token_sha256=meta['token_sha256'],chunk_len=CHUNK,actor_updates=version,
               global_step=int(state.global_step),episodes=episodes,transitions=len(rows),execution_settings=settings,
-              actor_sha256=digest(a.assets/'actor.pkl'),metrics={k:float(v) for k,v in metrics.items()},
+              ready=int(state.global_step)>=2000,metrics={k:float(v) for k,v in metrics.items()},
               stage='bc_warmup' if int(state.global_step)<=2000 else 'online_rl',time=time.time(),real_robot_evaluation='not yet validated')
-    temp=a.assets/'actor.json.partial';temp.write_text(json.dumps(info,indent=2)+'\n');temp.replace(a.assets/'actor.json')
+    publish(a.assets,serialization.to_bytes(state),payload,info)
     print(json.dumps(dict(status='actor_updated',version=version,stage=info['stage'])),flush=True)
 
 if __name__=='__main__':main()

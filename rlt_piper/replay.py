@@ -50,7 +50,7 @@ def main():
             try:run(a.root,Arm(),Cameras(),Bank(),Guard(),policy,initial,epoch-.2,cfg,recorder)
             except Finished:report['status']='passed'
             finally:
-                gaps=np.diff([t for t,q in recorder.commands]);ages=[r['received']-r['t'] for r in recorder.plans]
+                gaps=np.diff([row[0] for row in recorder.commands]);ages=[r['received']-r['t'] for r in recorder.plans]
                 report.update(accepted=len(recorder.plans),software_commands=len(recorder.commands),
                     max_control_gap_ms=float(1000*max(gaps)) if len(gaps) else None,
                     capture_to_action_p50_ms=float(1000*np.median(ages)) if ages else None)

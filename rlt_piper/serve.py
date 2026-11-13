@@ -1,27 +1,31 @@
 """Frozen-pi05 RLT server. No Corrector or hardware is loaded."""
-import argparse,json,os,time
+import argparse,json,os,time,signal
 from pathlib import Path
 import numpy as np
 from rlt_piper.contract import assets,SCHEMA
 from rlt_piper.policy import Policy
 
 class Service:
-    def __init__(self,policy):self.policy=policy
+    def __init__(self,policy,gate=None,learner=None):
+        from rlt_piper.live import PriorityGate
+        self.policy=policy;self.gate=gate or PriorityGate();self.learner=learner
+    def status(self):return self.learner.status if self.learner else dict(status='off')
     def infer(self,request):
         method=request.get('method')
-        response=dict(protocol=SCHEMA,request_id=request['request_id'],session=request['session'],ok=True,generation=0)
+        response=dict(protocol=SCHEMA,request_id=request['request_id'],session=request['session'],ok=True,generation=int(request.get('generation',0)),learner=self.status())
         if method=='status':return response
         if method not in ('infer','features'):raise ValueError('Unknown RLT request')
         if not np.isfinite(float(request['observed_at'])):raise ValueError('Invalid observation time')
         obs={k:request[k] for k in ['cam0','cam1','state','prompt']}
-        actions=self.policy.infer(obs)
+        with self.gate.inference():
+            actions=self.policy.infer(obs,features_only=True) if method=='features' else self.policy.infer(obs)
         if actions.shape!=(50,7) or not np.isfinite(actions).all():raise RuntimeError('Invalid RLT output')
         return dict(response,actions=actions,rlt=self.policy.last,observed_at=request['observed_at'])
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--assets',type=Path,required=True)
-    p.add_argument('--stage',choices=['collect','eval','online'],required=True);args=p.parse_args()
-    root=args.root.resolve();directory=args.assets.resolve();m=assets(directory,args.stage!='collect')
+    p.add_argument('--stage',choices=['collect','eval','online'],required=True);p.add_argument('--learn',action='store_true');args=p.parse_args()
+    root=args.root.resolve();directory=args.assets.resolve();m=assets(directory,args.stage=='eval')
     import jax
     from openpi.policies import policy_config
     from rtc_piper.model_adapter import training_config,PROMPT
@@ -40,6 +44,11 @@ def main():
     for _ in range(3):
         before=time.monotonic();out=policy.infer(obs);timings.append(time.monotonic()-before)
         if out.shape!=(50,7) or not np.isfinite(out).all():raise RuntimeError('Invalid warmed RLT output')
+    from rlt_piper.live import PriorityGate,Learner
+    gate=PriorityGate();learner=Learner(root,directory,policy,gate) if args.learn and args.stage!='eval' else None
+    if learner:learner.start()
+    def shutdown(*_):raise SystemExit(0)
+    signal.signal(signal.SIGTERM,shutdown)
     metadata=dict(protocol=SCHEMA,model='pi05_piper_rlt',base_step=2500,base_frozen=True,rlt_stage=args.stage,
                   rlt_actor_version=policy.version,rlt_chunk_len=18,rlt_token_sha256=m['token_sha256'],
                   action_horizon=50,physical_action_dim=7,fps=30,warmed_up=True,corrector_enabled=False,
@@ -48,6 +57,8 @@ def main():
                owner_root=str(root),status='ready',port=8003,metadata=metadata,hardware_opened=False)
     (root/'logs/rlt_service.json').write_text(json.dumps(state,indent=2)+'\n')
     from openpi.serving.websocket_policy_server import WebsocketPolicyServer
-    WebsocketPolicyServer(Service(policy),host='127.0.0.1',port=8003,metadata=metadata).serve_forever()
+    try:WebsocketPolicyServer(Service(policy,gate,learner),host='127.0.0.1',port=8003,metadata=metadata).serve_forever()
+    finally:
+        if learner:learner.close()
 
 if __name__=='__main__':main()

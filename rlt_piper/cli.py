@@ -26,17 +26,18 @@ def stop(process):
                 temp.write_text(json.dumps(state,indent=2)+'\n');temp.replace(path)
         except (OSError,ValueError):pass
 
-def start(directory,stage,guard=None):
-    assets(directory,stage!='collect')
+def start(directory,stage,guard=None,learn=False):
+    assets(directory,stage=='eval')
     from rtc_piper.model_services import stop_idle_corrector,stop_idle_other
     stop_idle_corrector(ROOT,guard);stop_idle_other(ROOT,'vpp2',guard);stop_idle_other(ROOT,'pi05',guard)
     with socket.socket() as s:
         if s.connect_ex(('127.0.0.1',8003))==0:raise RuntimeError('RLT port8003 is already occupied; no unknown service stopped')
     argv=[str(ROOT/'vendor/openpi/.venv/bin/python'),'-u','-m','rlt_piper.serve','--root',str(ROOT),'--assets',str(directory),'--stage',stage]
+    if learn:argv.append('--learn')
     with (ROOT/'logs/rlt_policy.log').open('a') as log:
         process=subprocess.Popen(argv,cwd=ROOT,env=environment(),stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     try:
-        until=time.monotonic()+180
+        until=time.monotonic()+300
         while time.monotonic()<until:
             if guard:guard.check()
             if process.poll() is not None:raise RuntimeError('RLT service startup failed; see logs/rlt_policy.log')
@@ -74,7 +75,7 @@ def check(directory,stage,settings):
             if client:client.close()
             stop(process)
 
-def execute(directory,stage,settings,learn):
+def execute(directory,stage,settings,learn,leader_config):
     from rtc_piper.hardware import follower_lock,check_interface,SdkArm
     from rtc_piper.observations import CaptureBank,RealSense
     from rtc_piper.safety import Guard,terminal_mode
@@ -84,26 +85,30 @@ def execute(directory,stage,settings,learn):
     from rlt_piper.recording import Recorder
     from rlt_piper.labels import Labels
     guard=Guard(settings['channel'],policy_timeout_s=.8);process=policy=arm=cameras=labels=recorder=lock=None
-    terminal=None;error=None
+    terminal=None;error=None;leader=None
     def signal_stop(*_):
         guard.stop.value=1
         if not guard.armed.value:raise KeyboardInterrupt
     old={sig:signal.signal(sig,signal_stop) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
     try:
         candidate=follower_lock(settings);candidate.__enter__();lock=candidate
-        guard.start();process=start(directory,stage,guard);policy=Client(stage)
+        guard.start();process=start(directory,stage,guard,learn=learn);policy=Client(stage)
+        if stage=='online' and not policy.metadata['rlt_actor_version']:
+            print('BASE WARMUP：当前由冻结π0.5控制；回放和BC预热完成后才在新chunk启用actor。',flush=True)
         guard.check();check_interface(settings);settings=live_settings(settings)
+        from rlt_piper.hil import Leader,Handover
+        leader=Leader(leader_config);handover=Handover()
         bank=CaptureBank();arm=SdkArm(settings,bank,guard);cameras=RealSense(settings,bank)
         state,stamps,code,enabled,obs=wait_ready(arm,cameras,bank,guard)
         if code==0 and any(enabled):raise RuntimeError('Arm already enabled by another session')
         starts=json.loads((ROOT/'training_start_states.json').read_text());row,target=choose_start(state,starts,settings)
-        print('RLT stage=%s，Corrector关闭；自动准备起点%d。S成功/F失败结束并阻尼停止；Space/Esc/Ctrl+C急停。'%(stage,row),flush=True)
+        print('RLT stage=%s，Corrector关闭；自动准备起点%d。I人工接管/交还；S成功/F失败结束并阻尼停止；Space/Esc/Ctrl+C急停。'%(stage,row),flush=True)
         print('固件恢复可能短暂失能，请承托机械臂并清空对齐通路。',flush=True)
-        recorder=Recorder(ROOT,stage,policy.metadata['rlt_token_sha256'],settings)
+        recorder=Recorder(ROOT,stage,policy.metadata['rlt_token_sha256'],settings);recorder.start()
         with terminal_mode(guard):
             after,previous=prepare(arm,cameras,bank,guard,starts,settings)
-            labels=Labels(recorder,guard);labels.start()
-            try:run(ROOT,arm,cameras,bank,guard,policy,previous,after,settings,recorder)
+            labels=Labels(recorder,guard,handover);labels.start()
+            try:run(ROOT,arm,cameras,bank,guard,policy,previous,after,settings,recorder,handover,leader)
             except RuntimeError as e:
                 if (recorder.label is None or recorder.error or str(e)!='Emergency stop latched or independent guard unavailable'):
                     recorder.label=None;error=repr(e);raise
@@ -119,30 +124,36 @@ def execute(directory,stage,settings,learn):
     finally:
         try:guard.close()
         finally:
-            if labels:labels.close()
-            if policy:policy.close()
-            if cameras:cameras.close()
-            if arm:arm.close()
-            stop(process)
-            if recorder:print('RLT episode:',recorder.save(terminal,error),flush=True)
-            if lock:lock.__exit__(None,None,None)
-            for sig,handler in old.items():signal.signal(sig,handler)
-    if learn and recorder and recorder.label is not None and terminal:train(directory)
+            try:
+                if labels:labels.close()
+                if policy:policy.close()
+                if cameras:cameras.close()
+                if arm:arm.close()
+                if leader:leader.close()
+                if recorder:print('RLT episode:',recorder.save(terminal,error),flush=True)
+            finally:
+                try:stop(process)
+                finally:
+                    if lock:lock.__exit__(None,None,None)
+                    for sig,handler in old.items():signal.signal(sig,handler)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('command',choices=['check','run','train'],default='check',nargs='?')
-    p.add_argument('--stage',choices=['collect','eval','online'],default='collect')
+    p.add_argument('--stage',choices=['collect','eval','online'],default='online')
+    p.add_argument('--leader-config',type=Path,default=Path('/home/arm/piper_teleop/config.json'))
     p.add_argument('--assets',type=Path,default=ROOT/'rlt_assets/pi05_2500');p.add_argument('--no-train',action='store_true');a=p.parse_args()
     from rtc_piper.cli import config
     from rtc_piper.profiles import select_model
-    settings=select_model(config(ROOT/'config.yaml'),'pi05',ROOT);directory=a.assets.resolve();assets(directory,a.stage!='collect')
-    if a.stage!='collect':
-        trained=json.loads((directory/'actor.json').read_text())['execution_settings']
+    settings=select_model(config(ROOT/'config.yaml'),'pi05',ROOT);directory=a.assets.resolve();assets(directory,a.stage=='eval')
+    from rlt_piper.checkpoint import snapshot
+    actor=snapshot(directory,assets(directory)['token_sha256']) if a.stage!='collect' else None
+    if actor:
+        trained=actor[1]['execution_settings']
         if any(settings.get(k)!=v for k,v in trained.items()):raise RuntimeError('RLT actor RTC/filter settings do not match this execution')
     (ROOT/'logs').mkdir(exist_ok=True)
     if a.command=='train':
         train(directory)
     elif a.command=='check':check(directory,a.stage,settings)
-    else:execute(directory,a.stage,settings,not a.no_train and a.stage!='eval')
+    else:execute(directory,a.stage,settings,not a.no_train and a.stage!='eval',a.leader_config)
 
 if __name__=='__main__':main()

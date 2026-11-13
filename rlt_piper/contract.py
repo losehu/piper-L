@@ -34,7 +34,7 @@ def absolute(actions,state,stats):
 
 def assets(directory,actor=False):
     directory=Path(directory)
-    required=['token.msgpack','token.json','norm_stats.json']+(['actor.pkl','actor.json'] if actor else [])
+    required=['token.msgpack','token.json','norm_stats.json']
     missing=[str(directory/x) for x in required if not (directory/x).is_file()]
     if missing:raise RuntimeError('RLT assets are not trained/installed yet: '+', '.join(missing))
     m=json.loads((directory/'token.json').read_text())
@@ -44,9 +44,7 @@ def assets(directory,actor=False):
             or m.get('norm_sha256')!=digest(directory/'norm_stats.json')):
         raise RuntimeError('RLT token/checkpoint/normalization identity mismatch')
     if actor:
-        a=json.loads((directory/'actor.json').read_text())
-        if (a.get('schema')!=SCHEMA or a.get('token_sha256')!=m['token_sha256']
-                or a.get('chunk_len')!=CHUNK or a.get('actor_updates',0)<1
-                or a.get('actor_sha256')!=digest(directory/'actor.pkl')):
-            raise RuntimeError('RLT actor is untrained or belongs to different token assets')
+        from rlt_piper.checkpoint import snapshot
+        if snapshot(directory,m['token_sha256']) is None:
+            raise RuntimeError('RLT actor is not trained/ready yet (untrained)')
     return m

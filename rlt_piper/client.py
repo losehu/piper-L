@@ -16,7 +16,7 @@ class Client:
                     or m.get('robot_connected') is not False):raise RuntimeError('RLT service identity mismatch')
         except BaseException:self.ws.close();raise
     def request(self,method,obs=None,command=None,generation=0,prompt=None):
-        self.counter+=1;payload=dict(method=method,session=self.session,request_id=self.counter)
+        self.counter+=1;payload=dict(method=method,session=self.session,request_id=self.counter,generation=int(generation))
         if obs is not None:
             from openpi_client.image_tools import resize_with_pad
             payload.update(state=np.asarray(obs.state,np.float32),observed_at=float(obs.t),prompt=prompt,
@@ -25,7 +25,7 @@ class Client:
         if isinstance(raw,str):raise RuntimeError(raw)
         result=self.codec.unpackb(raw)
         if (result.get('protocol')!=SCHEMA or result.get('request_id')!=self.counter or result.get('session')!=self.session
-                or result.get('ok') is not True):raise RuntimeError('RLT response identity mismatch')
+                or result.get('ok') is not True or result.get('generation')!=generation):raise RuntimeError('RLT response identity mismatch')
         if obs is not None and abs(float(result.get('observed_at',float('inf')))-obs.t)>1e-6:
             raise RuntimeError('RLT response belongs to another observation')
         return result
