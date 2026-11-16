@@ -15,11 +15,12 @@ class Finished(Exception):pass
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--config',type=Path,required=True)
     p.add_argument('--sample',type=Path,required=True);p.add_argument('--seconds',type=float,default=60)
-    p.add_argument('--port',type=int,default=8002);p.add_argument('--mode',choices=('monitor','truncate','full'),default='monitor')
+    p.add_argument('--port',type=int,default=None);p.add_argument('--mode',choices=('monitor','truncate','full'),default='monitor')
+    p.add_argument('--backend',choices=['jax','realtime-vla'],default='jax')
     p.add_argument('--output',type=Path,required=True);args=p.parse_args()
     from rtc_piper.cli import config
     from rtc_piper.profiles import select_model
-    settings=select_model(config(args.config),'pi05',args.root)
+    settings=select_model(config(args.config),'pi05',args.root,pi05_backend=args.backend)
     with np.load(args.sample,allow_pickle=False) as data:
         measured=np.array(data['state']);images={k:np.array(data[k]) for k in ('cam0','cam1')}
     initial=measured.copy();initial[:6]=np.clip(initial[:6],settings['policy_command_lower_rad'],settings['policy_command_upper_rad']);initial[6]=np.clip(initial[6],0,.1)
@@ -45,9 +46,10 @@ def main():
             self.commands+=1
         def grip(self,x,force):
             if not 0<=x<=.1:raise RuntimeError('Bad software gripper command')
-    session=Session(args.mode);policy=Client(args.port,session);observer=Client(args.port,session);arm=Arm()
+    port=args.port or settings.get('corrector_policy_port',8002)
+    session=Session(args.mode);policy=Client(port,session,backend=args.backend);observer=Client(port,session,backend=args.backend);arm=Arm()
     args.root.mkdir(parents=True,exist_ok=True);(args.root/'logs').mkdir(exist_ok=True)
-    report=dict(hardware_opened=False,robot_commands_sent=0,source='repeated saved images/state with synthetic replay timestamps',mode=args.mode)
+    report=dict(hardware_opened=False,robot_commands_sent=0,source='repeated saved images/state with synthetic replay timestamps',mode=args.mode,backend=args.backend)
     try:
         run(args.root,arm,Cameras(),Bank(),Guard(),policy,observer,initial,epoch-.2,settings)
     except Finished:report['status']='passed'

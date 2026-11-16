@@ -12,11 +12,16 @@ ROOT=Path(os.environ.get('PIPER_DEPLOY_ROOT',str(Path(__file__).resolve().parent
 
 
 def ensure_service(root,assets,settings,guard=None):
+    if settings.get('inference_backend')=='realtime-vla':
+        from rtc_piper.pi05_backend import ensure
+        client=ensure(root,settings,guard,mode='corrector',assets=assets);client.close();return
     from rtc_piper.model_services import process_args,stop_idle_other
     from corrector.client import Client,Session
     for name in ('mlp.npz','metadata.json','norm_stats.json'):
         if not (assets/name).is_file():raise RuntimeError('Corrector asset missing: '+str(assets/name))
     expected=json.loads((assets/'metadata.json').read_text())
+    from rtc_piper.pi05_backend import stop_idle
+    stop_idle(root,guard)
     def connect():
         client=Client(8002,Session('monitor'))
         if (client.metadata.get('contract')!=expected['contract']
@@ -53,7 +58,8 @@ def check(root,settings,assets,mode):
     from rtc_piper.policy import validate_actions
     from corrector.client import Client,Session
     with follower_lock(settings):
-        ensure_service(root,assets,settings);session=Session(mode);client=Client(8002,session)
+        ensure_service(root,assets,settings);session=Session(mode);client=Client(
+            settings.get('corrector_policy_port',8002),session,backend=settings.get('inference_backend','jax'))
         try:
             with np.load(root/'offline_sample.npz',allow_pickle=False) as sample:
                 state=np.array(sample['state']);images={k:np.array(sample[k]) for k in ('cam0','cam1')}
@@ -85,7 +91,8 @@ def execute(root,settings,assets,mode):
     try:
         guard.start();candidate=follower_lock(settings);candidate.__enter__();lock=candidate
         ensure_service(root,assets,settings,guard);session=Session(mode)
-        policy=Client(8002,session);observer=Client(8002,session);policy.request('status')
+        port=settings.get('corrector_policy_port',8002);backend=settings.get('inference_backend','jax')
+        policy=Client(port,session,backend=backend);observer=Client(port,session,backend=backend);policy.request('status')
         guard.check();check_interface(settings);settings=live_settings(settings)
         bank=CaptureBank();arm=SdkArm(settings,bank,guard);cameras=RealSense(settings,bank)
         state,stamps,code,enabled,obs=wait_ready(arm,cameras,bank,guard)
@@ -110,11 +117,12 @@ def execute(root,settings,assets,mode):
 def main():
     p=argparse.ArgumentParser();p.add_argument('command',choices=('check','run'),nargs='?',default='check')
     p.add_argument('--mode',choices=('monitor','truncate','full'),default='monitor')
+    p.add_argument('--backend',choices=['jax','realtime-vla'],default=None,help='pi05 compute backend; default JAX')
     p.add_argument('--assets',type=Path,default=ROOT/'corrector_assets/pi05_2500_k5')
     p.add_argument('--config',type=Path,default=ROOT/'config.yaml');args=p.parse_args()
     from rtc_piper.cli import config
     from rtc_piper.profiles import select_model
-    settings=select_model(config(args.config),'pi05',ROOT)
+    settings=select_model(config(args.config),'pi05',ROOT,pi05_backend=args.backend)
     if settings['model_step']!=2500 or settings['checkpoint_index']!=2499:raise ValueError('Corrector is trained for2500 only')
     (ROOT/'logs').mkdir(exist_ok=True)
     os.environ.setdefault('DISPLAY',':0');os.environ.setdefault('XAUTHORITY','/run/user/%d/gdm/Xauthority'%os.getuid())

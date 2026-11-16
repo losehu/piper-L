@@ -15,7 +15,7 @@ class Session:
 
 
 class Client:
-    def __init__(self,port,session):
+    def __init__(self,port,session,backend='jax'):
         from websockets.sync.client import connect
         from openpi_client import msgpack_numpy
         self.codec=msgpack_numpy;self.session=session
@@ -26,7 +26,8 @@ class Client:
         if (self.metadata.get('protocol')!=VERSION or self.metadata.get('training_updates')!=2500
             or self.metadata.get('source_checkpoint_index')!=2499 or self.metadata.get('action_horizon')!=50
             or self.metadata.get('physical_action_dim')!=7 or not self.metadata.get('warmed_up')
-            or self.metadata.get('robot_connected') is not False):
+            or self.metadata.get('robot_connected') is not False
+            or self.metadata.get('inference_backend','jax')!=backend):
             self.close();raise RuntimeError('Wrong pi05 Corrector service identity')
 
     def request(self,method,obs=None,command=None,generation=0,prompt=None):

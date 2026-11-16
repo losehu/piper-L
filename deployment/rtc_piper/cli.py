@@ -55,6 +55,9 @@ def ensure_policy(settings,guard=None,owns_hardware_lock=False):
         from rtc_piper.hardware import follower_lock
         with follower_lock(settings):return ensure_policy(settings,guard,owns_hardware_lock=True)
     kind=settings.get('model_name','pi05')
+    if kind=='pi05' and settings.get('inference_backend')=='realtime-vla':
+        from rtc_piper.pi05_backend import ensure
+        return ensure(ROOT,settings,guard)
     if kind=='vpp2':
         check_vpp2_assets(ROOT,settings)
         stop_changed_vpp2(ROOT,settings,guard)
@@ -62,6 +65,8 @@ def ensure_policy(settings,guard=None,owns_hardware_lock=False):
         from rtc_piper.model_services import prepare_pi05
         prepare_pi05(ROOT,settings,guard)
     stop_idle_corrector(ROOT,guard)
+    from rtc_piper.pi05_backend import stop_idle
+    stop_idle(ROOT,guard)
     stop_idle_other(ROOT,kind,guard)
     def connect():
         if guard:guard.check()
@@ -238,6 +243,7 @@ def main():
     parser.add_argument('--model',type=str.lower,choices=['pi05','vpp2'],default='pi05')
     parser.add_argument('--compile',dest='compile_vpp2',action='store_const',const=True,default=None)
     parser.add_argument('--pi05-step',type=int,choices=[1500,2500],default=None)
+    parser.add_argument('--backend',choices=['jax','realtime-vla'],default=None,help='pi05 compute backend; default JAX')
     parser.add_argument('--no-smoothing',action='store_true',help='Disable chunk bridge and output filter, retain command limits')
     parser.add_argument('--no-rtc',action='store_true',help='Execute all50 pi05 frames, then observe and infer; no prefetch')
     args=parser.parse_args();(ROOT/'logs').mkdir(exist_ok=True)
@@ -245,13 +251,15 @@ def main():
     os.environ.setdefault('XAUTHORITY','/run/user/%d/gdm/Xauthority'%os.getuid())
     from rtc_piper.profiles import select_model
     settings=select_model(config(args.config),args.model,ROOT,compile_vpp2=args.compile_vpp2,
-                          pi05_step=args.pi05_step,no_smoothing=args.no_smoothing,no_rtc=args.no_rtc)
+                          pi05_step=args.pi05_step,no_smoothing=args.no_smoothing,no_rtc=args.no_rtc,pi05_backend=args.backend)
     print('模型：%s，checkpoint=%d，%d帧，调度=%s。'%(
         settings['model_name'],settings['model_step'],settings['action_horizon'],settings['execution_mode']),flush=True)
     if settings['model_name']=='vpp2':
         print('VPP2采样：%d步，动作去噪torch.compile=%s。'%(
             settings['denoising_steps'],settings['compile_vpp2']),flush=True)
-    else:print('π0.5平滑：%s。'%('开启' if settings.get('smoothing_enabled',True) else '关闭（保留限位/限速）'),flush=True)
+    else:
+        print('π0.5推理后端：%s。'%settings['inference_backend'],flush=True)
+        print('π0.5平滑：%s。'%('开启' if settings.get('smoothing_enabled',True) else '关闭（保留限位/限速）'),flush=True)
     if args.command=='check':offline_check(settings)
     elif args.command=='sensors':sensors(settings,args.seconds)
     else:execute(settings)

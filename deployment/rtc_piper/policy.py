@@ -112,7 +112,7 @@ class Client:
         from openpi_client import msgpack_numpy
         self.codec = msgpack_numpy
         self.ws = connect('ws://127.0.0.1:%d'%config['policy_port'],
-                          compression=None,max_size=8*1024**2,open_timeout=3,
+                          proxy=None,compression=None,max_size=8*1024**2,open_timeout=3,
                           close_timeout=1,ping_interval=None)
         self.metadata = self.codec.unpackb(self.ws.recv(timeout=3))
         if (self.metadata.get('model')!='pi05_piper_grasp_%d'%config['model_step']
@@ -120,7 +120,8 @@ class Client:
                 or self.metadata.get('source_checkpoint_index')!=config['checkpoint_index']
                 or self.metadata.get('action_horizon')!=50
                 or self.metadata.get('physical_action_dim')!=7
-                or self.metadata.get('fps')!=30 or not self.metadata.get('warmed_up')):
+                or self.metadata.get('fps')!=30 or not self.metadata.get('warmed_up')
+                or self.metadata.get('inference_backend','jax')!=config.get('inference_backend','jax')):
             self.ws.close()
             raise RuntimeError('Wrong policy identity/shape/rate or policy not warmed')
         self.request_id = 0

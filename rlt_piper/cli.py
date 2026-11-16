@@ -28,6 +28,8 @@ def stop(process):
 
 def start(directory,stage,guard=None,learn=False):
     assets(directory,stage=='eval')
+    from rtc_piper.pi05_backend import stop_idle
+    stop_idle(ROOT,guard)
     from rtc_piper.model_services import stop_idle_corrector,stop_idle_other
     stop_idle_corrector(ROOT,guard);stop_idle_other(ROOT,'vpp2',guard);stop_idle_other(ROOT,'pi05',guard)
     with socket.socket() as s:

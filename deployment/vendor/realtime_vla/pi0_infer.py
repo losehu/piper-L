@@ -1,0 +1,1780 @@
+import torch
+import triton
+import triton.language as tl
+from contextlib import contextmanager
+import threading
+
+_launch_state = threading.local()
+
+
+@triton.jit
+def pdl_wait(enabled : tl.constexpr):
+    if enabled:
+        tl.inline_asm_elementwise(
+            'griddepcontrol.wait; // dummy $0', '=r', [],
+            dtype = tl.int32, is_pure = False, pack = 1
+        )
+
+
+@triton.jit
+def pdl_trigger(enabled : tl.constexpr):
+    if enabled:
+        tl.inline_asm_elementwise(
+            'griddepcontrol.launch_dependents; // dummy $0', '=r', [],
+            dtype = tl.int32, is_pure = False, pack = 1
+        )
+
+
+class _PdlKernel:
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            enabled = getattr(_launch_state, 'enabled', False)
+            kwargs['USE_PDL'] = enabled
+            if enabled:
+                kwargs['launch_pdl'] = True
+            return self.kernel[grid](*args, **kwargs)
+        return launch
+
+    def __getattr__(self, name):
+        return getattr(self.kernel, name)
+
+
+def pdl_kernel(kernel):
+    return _PdlKernel(kernel)
+
+
+@contextmanager
+def pdl_scope(enabled):
+    previous = getattr(_launch_state, 'enabled', False)
+    _launch_state.enabled = enabled
+    try:
+        yield
+    finally:
+        _launch_state.enabled = previous
+
+
+@pdl_kernel
+@triton.jit
+def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.load(
+            res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        ).to(tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small_bias_res_mod(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                            i_mod : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.load(
+            res_ptr + ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] % i_mod) * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        ).to(tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def scaled_matmul_small_bias_res(inp_ptr, inp_norm_factor_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+
+        norm_factor = tl.load(
+            inp_norm_factor_ptr + i + tl.arange(0, BLOCK_SIZE_N),
+            mask = i + tl.arange(0, BLOCK_SIZE_N) < seq_len, other=0
+        )
+        acc = tl.load(
+            res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        ).to(tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            x = x * norm_factor[:, None]
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small_bias(inp_ptr, weight_ptr, out_ptr, bias_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small_bias_silu(inp_ptr, weight_ptr, out_ptr, bias_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        acc = acc * tl.sigmoid(acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small_res(inp_ptr, weight_ptr, out_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.load(
+            res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        ).to(tl.float32)
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small(inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_small_bias_gelu(inp_ptr, weight_ptr, out_ptr, bias_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        acc += tl.load(
+            bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_split_k(inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+                         BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr, SPLIT_K : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    grid_k = SPLIT_K
+    for p in range(pid, grid_i * grid_j * grid_k, psize):
+        i = (p // (grid_j*grid_k)) * BLOCK_SIZE_N
+        j = (p //grid_k % grid_j) * BLOCK_SIZE_M
+        k_s = p % grid_k
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        k_beg = k_s * tl.cdiv(features, BLOCK_SIZE_K) // SPLIT_K * BLOCK_SIZE_K
+        k_end = (k_s + 1) * tl.cdiv(features, BLOCK_SIZE_K) // SPLIT_K * BLOCK_SIZE_K
+        for k in range(k_beg, k_end, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :] + k_s * seq_len * hidden,
+            acc,
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def merge_split_k_bias_res(out_ptr, bias_ptr, res_ptr, final_out_ptr, seq_len : tl.constexpr, hidden : tl.constexpr, SPLIT_K : tl.constexpr, BLOCK: tl.constexpr = 512, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    for i in range(pid * BLOCK, seq_len * hidden, psize * BLOCK):
+        acc = tl.load(
+            res_ptr + i + tl.arange(0, BLOCK),
+            mask = (i + tl.arange(0, BLOCK)) < (seq_len * hidden),
+            other = 0.0
+        ).to(tl.float32)
+        acc += tl.load(
+            bias_ptr + (i + tl.arange(0, BLOCK)) % hidden,
+            mask = (i + tl.arange(0, BLOCK)) < (seq_len * hidden),
+            other = 0.0
+        ).to(tl.float32)
+        for k in range(SPLIT_K):
+            offset = k * seq_len * hidden
+            mask = (i +  tl.arange(0, BLOCK)) < (seq_len * hidden)
+            vals = tl.load(out_ptr + offset + i +  tl.arange(0, BLOCK), mask=mask, other=0.0)
+            acc += vals.to(tl.float32)
+        mask = (i +  tl.arange(0, BLOCK)) < (seq_len * hidden)
+        tl.store(final_out_ptr + i +  tl.arange(0, BLOCK), acc.to(tl.bfloat16), mask=mask)
+    pdl_trigger(USE_PDL)
+
+def conv2d_embed_n256_1152_res(images, patch_w, patch_b, pos_emb, out):
+    nviews = images.shape[0]
+    img_input = images.view(nviews, 16, 14, 16, 14, 3).permute(0, 1, 3, 2, 4, 5).contiguous()
+    matmul_small_bias_res_mod[(256 * nviews // 64) * (1152 // 64),](
+        img_input,
+        patch_w,
+        out,
+        patch_b,
+        pos_emb,
+        seq_len = 256 * nviews,
+        features = 3 * 14 * 14,
+        hidden = 1152,
+        i_mod = 256,
+        BLOCK_SIZE_N = 64,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 32
+    )
+
+@pdl_kernel
+@triton.jit
+def layer_norm_small_kernel(x_ptr, out_ptr, norm_w_ptr, norm_b_ptr, seq_len : tl.constexpr, features : tl.constexpr, eps : tl.constexpr = 1e-5, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+
+    MAX_LEN : tl.constexpr = 2048
+
+    for i in range(pid, seq_len, psize):
+        x = tl.load(x_ptr + i * features + tl.arange(0, MAX_LEN), mask = tl.arange(0, MAX_LEN) < features, other = 0.0)
+        mean = tl.sum(x) * (1.0 / features)
+        x_centered = x - mean
+        var = tl.sum(x_centered * x_centered * (tl.arange(0, MAX_LEN) < features)) * (1.0 / features)
+        inv_std = 1.0 / tl.sqrt(var+ eps)
+        x = x_centered * inv_std
+        x = x * tl.load(norm_w_ptr + tl.arange(0, MAX_LEN), mask = tl.arange(0, MAX_LEN) < features, other = 0.0)
+        x = x + tl.load(norm_b_ptr + tl.arange(0, MAX_LEN), mask = tl.arange(0, MAX_LEN) < features, other = 0.0)
+        tl.store(out_ptr + i * features + tl.arange(0, MAX_LEN), x.to(tl.bfloat16), mask = tl.arange(0, MAX_LEN) < features)
+    pdl_trigger(USE_PDL)
+
+def layer_norm_n256_1152(x, norm_w, norm_b, out):
+    num_views = x.shape[0]
+    seq_len = 256 * num_views
+    layer_norm_small_kernel[seq_len,](
+        x,
+        out,
+        norm_w,
+        norm_b,
+        seq_len = seq_len,
+        features = 1152
+    )
+
+def layer_norm_QKV_matmul_n256_1152_3456_bias(x, norm_w, norm_b, qkv_w, qkv_b, out, x_norm, tile=None):
+    if tile is not None:
+        seq_len = x.shape[0] * 256
+        block_n, block_m, block_k, warps, stages = tile
+        layer_norm_small_kernel[(seq_len,)](x, x_norm, norm_w, norm_b, seq_len, 1152)
+        matmul_small_bias[(triton.cdiv(seq_len, block_n) * triton.cdiv(3456, block_m),)](
+            x_norm, qkv_w, out, qkv_b, seq_len, 1152, 3456,
+            BLOCK_SIZE_N=block_n, BLOCK_SIZE_M=block_m, BLOCK_SIZE_K=block_k,
+            num_warps=warps, num_stages=stages
+        )
+        return
+    num_views = x.shape[0]
+    seq_len = 256 * num_views
+    layer_norm_small_kernel[seq_len,](
+        x,
+        x_norm,
+        norm_w,
+        norm_b,
+        seq_len = seq_len,
+        features = 1152
+    )
+
+    matmul_small_bias[((seq_len + 63) // 64) * (3456 // 64),](
+        x_norm,
+        qkv_w,
+        out,
+        qkv_b,
+        seq_len = seq_len,
+        features = 1152,
+        hidden = 3456,
+        BLOCK_SIZE_N = 64,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 32
+    )
+
+@pdl_kernel
+@triton.jit
+def matmul_512x1152x1152_twopart_bias_res(old_ptr, inp_ptr, weight_ptr, bias_ptr, out_ptr, out2_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    hidden1 = 1024
+
+    BLOCK_SIZE_N1 : tl.constexpr = 64
+    BLOCK_SIZE_M1 : tl.constexpr = 64
+    BLOCK_SIZE_K1 : tl.constexpr = 32
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N1)
+    grid_j = tl.cdiv(hidden1, BLOCK_SIZE_M1)
+
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N1
+        j = (p % grid_j) * BLOCK_SIZE_M1
+        acc = tl.load(old_ptr + (i + tl.arange(0, BLOCK_SIZE_N1))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M1))[None, :]).to(tl.float32)
+        acc += tl.load(bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M1))[None, :]).to(tl.float32)
+        for k in range(0, features, BLOCK_SIZE_K1):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N1))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K1))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N1))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K1))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K1))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M1))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K1))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M1))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N1))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M1))[None, :],
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N1))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M1))[None, :] < hidden)
+        )
+
+    BLOCK_SIZE_N2 : tl.constexpr = 32
+    BLOCK_SIZE_M2 : tl.constexpr = 32
+    BLOCK_SIZE_K2 : tl.constexpr = 32
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N2)
+    grid_j = tl.cdiv(hidden - hidden1, BLOCK_SIZE_M2)
+    grid_k = 4
+    for p in range(pid, grid_i * grid_j * grid_k, psize):
+        i = (p // (grid_j*grid_k)) * BLOCK_SIZE_N2
+        j = ((p //grid_k) % grid_j) * BLOCK_SIZE_M2 + hidden1
+        k0 = p % grid_k
+        acc = tl.zeros((BLOCK_SIZE_N2, BLOCK_SIZE_M2), dtype=tl.float32)
+        if k0 == 0:
+            acc += tl.load(old_ptr + (i + tl.arange(0, BLOCK_SIZE_N2))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M2))[None, :]).to(tl.float32)
+            acc += tl.load(bias_ptr + (j + tl.arange(0, BLOCK_SIZE_M2))[None, :]).to(tl.float32)
+        for k in range(k0 * BLOCK_SIZE_K2, features, BLOCK_SIZE_K2 * grid_k):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N2))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K2))[None, :],
+                mask = ((i + tl.arange(0, BLOCK_SIZE_N2))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K2))[None, :] < features),
+                other = 0.0
+            )
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K2))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M2))[None, :],
+                mask = ((k + tl.arange(0, BLOCK_SIZE_K2))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M2))[None, :] < hidden),
+                other = 0.0
+            )
+            acc = tl.dot(x, w, acc)
+        tl.store(
+            out2_ptr + (i + tl.arange(0, BLOCK_SIZE_N2))[:, None] * ((hidden - hidden1)*grid_k) + (j - hidden1 + tl.arange(0, BLOCK_SIZE_M2))[None, :] + k0 * (hidden - hidden1),
+            acc.to(tl.bfloat16),
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N2))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M2))[None, :] < hidden)
+        )
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def combine_1536_1152_twopart(out_ptr, inp_ptr, seq_len:tl.constexpr, hidden:tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    for i in range(pid * 2, seq_len, psize * 2):
+        inp = tl.load(inp_ptr + (i + tl.arange(0, 2)[:, None]) * 128 * 4 + tl.arange(0, 128)).to(tl.float32)
+        for j in range(1, 4):
+            inp += tl.load(inp_ptr + (i + tl.arange(0, 2)[:, None]) * 128 * 4 + tl.arange(0, 128) + 128 * j).to(tl.float32)
+        tl.store(out_ptr + (i + tl.arange(0, 2)[:, None]) * hidden + 1024 + tl.arange(0, 128), inp.to(tl.bfloat16))
+    pdl_trigger(USE_PDL)
+
+def matmul_n256_1152_1152_bias_res(x, weight, bias, res, out, buf):
+    num_views = x.shape[0]
+    if num_views == 2:
+        matmul_512x1152x1152_twopart_bias_res[(256,)](
+            old_ptr = res,
+            inp_ptr = x,
+            weight_ptr = weight,
+            bias_ptr = bias,
+            out_ptr = out,
+            out2_ptr = buf,
+            seq_len = 512,
+            features = 1152,
+            hidden = 1152,
+        )
+        combine_1536_1152_twopart[(256,)](
+            inp_ptr = buf,
+            out_ptr = out,
+            seq_len = 512,
+            hidden = 1152,
+        )
+        return
+    seq_len = 256 * num_views
+    matmul_small_bias_res[((seq_len + 31) // 32) * (1152 // 64),](
+        x,
+        weight,
+        out,
+        bias,
+        res,
+        seq_len = seq_len,
+        features = 1152,
+        hidden = 1152,
+        BLOCK_SIZE_N = 32,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 32
+    )
+
+def layer_norm_matmul_n256_1152_4304_bias_gelu(x, norm_w, norm_b, weight, bias, out, x_norm):
+    num_views = x.shape[0]
+    seq_len = 256 * num_views
+
+    layer_norm_small_kernel[seq_len,](
+        x,
+        x_norm,
+        norm_w,
+        norm_b,
+        seq_len = seq_len,
+        features = 1152
+    )
+
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_K = 64
+    matmul_small_bias_gelu[((seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N) * ((4304 + (BLOCK_SIZE_M - 1)) // BLOCK_SIZE_M),](
+        x_norm,
+        weight,
+        out,
+        bias,
+        seq_len = seq_len,
+        features = 1152,
+        hidden = 4304,
+        BLOCK_SIZE_N = BLOCK_SIZE_N,
+        BLOCK_SIZE_M = BLOCK_SIZE_M,
+        BLOCK_SIZE_K = BLOCK_SIZE_K
+    )
+
+def matmul_n256_4304_1152_bias_res(x, weight, bias, res, out, buf):
+    num_views = x.shape[0]
+    seq_len = 256 * num_views
+    matmul_split_k[((seq_len + 64) // 64) * (1152 // 64) * 4,](
+        x,
+        weight,
+        buf,
+        seq_len = seq_len,
+        features = 4304,
+        hidden = 1152,
+        BLOCK_SIZE_N = 64,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 64,
+        SPLIT_K = 4
+    )
+    merge_split_k_bias_res[(seq_len * 1152 + 1023) // 1024,](
+        buf,
+        bias,
+        res,
+        out,
+        seq_len = seq_len,
+        hidden = 1152,
+        SPLIT_K = 4
+    )
+
+@torch.compile
+def AttnMultiKey(QKV):
+    QKV = QKV.view(-1, 256, 3, 16, 72).permute(0, 2, 3, 1, 4)
+    Q = QKV[:, 0]
+    K = QKV[:, 1]
+    V = QKV[:, 2]
+    attn = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+    attn = attn.transpose(1, 2).reshape(Q.shape[0], 256, 1152)
+    return attn
+
+def vision_encoder(weights, buffers, num_views):
+    conv2d_embed_n256_1152_res(
+        buffers['observation_images_normalized'],
+        weights['vision_patch_embedding_w'],
+        weights['vision_patch_embedding_b'],
+        weights['vision_position_embedding'],
+        buffers['vision_x']
+    )
+
+    for i in range(27):
+        layer_norm_QKV_matmul_n256_1152_3456_bias(
+            buffers['vision_x'],
+            weights['vision_pre_attn_norm_w'][i],
+            weights['vision_pre_attn_norm_b'][i],
+            weights['vision_attn_qkv_w'][i],
+            weights['vision_attn_qkv_b'][i],
+            buffers['vision_QKV'],
+            buffers['vision_x_norm'],
+            tile=buffers.get('vision_qkv_tile'),
+        )
+
+        attn = AttnMultiKey(buffers['vision_QKV'])
+
+        matmul_n256_1152_1152_bias_res(
+            attn,
+            weights['vision_attn_o_w'][i],
+            weights['vision_attn_o_b'][i],
+            buffers['vision_x'],
+            buffers['vision_x'],
+            buffers['vision_x_split_k_buf']
+        )
+
+        layer_norm_matmul_n256_1152_4304_bias_gelu(
+            buffers['vision_x'],
+            weights['vision_pre_ffn_norm_w'][i],
+            weights['vision_pre_ffn_norm_b'][i],
+            weights['vision_ffn_up_w'][i],
+            weights['vision_ffn_up_b'][i],
+            buffers['vision_hidden'],
+            buffers['vision_x_norm']
+        )
+
+        matmul_n256_4304_1152_bias_res(
+            buffers['vision_hidden'],
+            weights['vision_ffn_down_w'][i],
+            weights['vision_ffn_down_b'][i],
+            buffers['vision_x'],
+            buffers['vision_x'],
+            buffers['vision_x_split_k_buf']
+        )
+
+@pdl_kernel
+@triton.jit
+def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(axis=0)
+    psize = tl.num_programs(axis=0)
+    BLOCK_SIZE : tl.constexpr = 512
+    for i in range(pid, seq_len, psize):
+        sum_x = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        for j in range(0, features, BLOCK_SIZE):
+            x = tl.load(inp_ptr + i * features + j + tl.arange(0, BLOCK_SIZE))
+            sum_x += x * x
+        factor = tl.rsqrt(tl.sum(sum_x) / features + 1e-6)
+
+        for j in range(0, features, BLOCK_SIZE):
+            x = tl.load(inp_ptr + i * features + j + tl.arange(0, BLOCK_SIZE))
+            x = x * factor
+            tl.store(out_ptr + i * features + j + tl.arange(0, BLOCK_SIZE), x)
+    pdl_trigger(USE_PDL)
+@pdl_kernel
+@triton.jit
+def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr = 128,
+    BLOCK_SIZE_M : tl.constexpr = 64,
+    BLOCK_SIZE_K : tl.constexpr = 32, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+
+    pid1 = tl.program_id(axis=0)
+    psize1 = tl.num_programs(axis=0)
+    pid2 = tl.program_id(axis=1)
+    psize2 = tl.num_programs(axis=1)
+    
+    for i in range(pid1 * BLOCK_SIZE_N, seq_len, psize1 * BLOCK_SIZE_N):
+        for j in range(pid2 * BLOCK_SIZE_M, hidden, psize2 * BLOCK_SIZE_M):
+            acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+            acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+            for k in range(0, features, BLOCK_SIZE_K):
+                x = tl.load(
+                    inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), 
+                    mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len,
+                    other = 0.0
+                )
+                w = tl.load(weight1_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+                acc = tl.dot(x, w, acc)
+                w2 = tl.load(weight2_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+                acc2 = tl.dot(x, w2, acc2)
+            acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+            acc = (acc * acc2).to(tl.bfloat16)
+            tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr = 64,
+    BLOCK_SIZE_M : tl.constexpr = 64,
+    BLOCK_SIZE_K : tl.constexpr = 64, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for p in range(pid, grid_i * grid_j, psize):
+        i = (p // grid_j) * BLOCK_SIZE_N
+        j = (p % grid_j) * BLOCK_SIZE_M
+        norm_factor = tl.load(
+            inp_norm_factor_ptr + i + tl.arange(0, BLOCK_SIZE_N),
+            mask = i + tl.arange(0, BLOCK_SIZE_N) < seq_len, other=0
+        )
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        for k in range(0, features, BLOCK_SIZE_K):
+            x = tl.load(
+                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), 
+                mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len,
+                other = 0.0
+            )
+            x = x * norm_factor[:, None]
+            w = tl.load(weight1_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+            acc = tl.dot(x, w, acc)
+            w2 = tl.load(weight2_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+            acc2 = tl.dot(x, w2, acc2)
+        acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+        acc = (acc * acc2).to(tl.bfloat16)
+        tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
+    pdl_trigger(USE_PDL)
+
+def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
+    seq_len = x.shape[0]
+    rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
+    matmul_small_gate[( (seq_len + 127)//128, (16384 + 63)//64 )](
+        x_norm, weight1, weight2, out, seq_len,
+        2048, 16384
+    )
+
+def matmul_n_16384_2048_res(x, weight, out, group=None):
+    if group is not None:
+        seq_len = x.shape[0]
+        matmul_grouped_res[(triton.cdiv(seq_len, 64) * (2048 // 64),)](
+            x, weight, out, seq_len, 16384, 2048, 64, 64, 64, group, False,
+            num_warps=4, num_stages=3
+        )
+        return
+    seq_len = x.shape[0]
+    BLOCK_SIZE_N = 128
+    if seq_len < 512:
+        BLOCK_SIZE_N = 64
+    matmul_small_res[((seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N) * (2048 // 64),](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 16384,
+        hidden = 2048,
+        BLOCK_SIZE_N = BLOCK_SIZE_N,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 64
+    )
+
+def layer_norm_matmul_n256_1152_2048_bias(x, norm_w, norm_b, proj_w, proj_b, out, x_norm):
+    seq_len = x.shape[0] * 256
+    layer_norm_small_kernel[seq_len,](
+        x,
+        x_norm,
+        norm_w,
+        norm_b,
+        seq_len = seq_len,
+        features = 1152,
+        eps = 1e-5
+    )
+    matmul_small_bias[((seq_len + 63) // 64) * (2048 // 64),](
+        x_norm,
+        proj_w,
+        out,
+        proj_b,
+        seq_len = seq_len,
+        features = 1152,
+        hidden = 2048,
+        BLOCK_SIZE_N = 64,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 64
+    )
+
+@pdl_kernel
+@triton.jit
+def matmul_n_2048_2560_qkv_rope(inp_ptr, weight_QKV_ptr, rope_weights_ptr, Q_ptr, K_ptr, V_ptr, seq_len : tl.constexpr, features : tl.constexpr, head_dim : tl.constexpr, num_head : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    BLOCK_SIZE_N : tl.constexpr = 64
+    BLOCK_SIZE_M : tl.constexpr = 64
+    BLOCK_SIZE_K : tl.constexpr = 64
+    pid1 = tl.program_id(axis=0)
+    psize1 = tl.num_programs(axis=0)
+    pid2 = tl.program_id(axis=1)
+    psize2 = tl.num_programs(axis=1)
+    for i in range(pid1 * BLOCK_SIZE_N, seq_len, psize1 * BLOCK_SIZE_N):
+        for j in range(pid2 * BLOCK_SIZE_M, (num_head + 2) * head_dim, psize2 * BLOCK_SIZE_M):
+            acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+            for k in range(0, features, BLOCK_SIZE_K):
+                x = tl.load(inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), mask = tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i, other = 0.0)
+                w = tl.load(weight_QKV_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * ((num_head + 2) * head_dim) + j + tl.arange(0, BLOCK_SIZE_M))
+                acc = tl.dot(x, w, acc)
+            acc = acc.to(tl.bfloat16)
+            if j < (num_head + 1) * head_dim:
+                x0, x1 = tl.split(acc.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M // 2, 2))
+                x_cossin = tl.load(rope_weights_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * head_dim + j % head_dim + tl.arange(0, BLOCK_SIZE_M)[None, :], mask = tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i, other = 0.0)
+                x_cos, x_sin = tl.split(x_cossin.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M // 2, 2))
+                x0_ = x0 * x_cos - x1 * x_sin
+                x1_ = x1 * x_cos + x0 * x_sin
+                acc = tl.interleave(x0_, x1_)
+            if j < num_head * head_dim:
+                out_ptr = Q_ptr
+                out_stride = num_head * head_dim
+            elif j < (num_head + 1) * head_dim:
+                out_ptr = K_ptr
+                out_stride = head_dim
+            else:
+                out_ptr = V_ptr
+                out_stride = head_dim
+            tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * out_stride + j % out_stride + tl.arange(0, BLOCK_SIZE_M), acc, mask = tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i)
+    pdl_trigger(USE_PDL)
+
+def rms_matmul_n_2048_2560_qkv_rope(x, weight_qkv, rope_weight, Q, K, V, x_norm):
+    seq_len = x.shape[0]
+    rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
+    matmul_n_2048_2560_qkv_rope[((seq_len + 63) // 64, 2560 // 64)](
+        x_norm, weight_qkv, rope_weight, Q, K, V, seq_len, 2048, 256, 8
+    )
+
+@torch.compile
+def AttnSingleKey(Q, K, V, scale):
+    logits = torch.matmul(Q, K.T) * scale
+    logits = torch.nn.functional.softmax(logits, dim=-1)
+    attn = torch.matmul(logits, V).view(-1, 2048)
+    return attn
+
+def matmul_n_2048_2048_res(x, weight, out, group=None):
+    if group is not None:
+        seq_len = x.shape[0]
+        matmul_grouped_res[(triton.cdiv(seq_len, 64) * (2048 // 64),)](
+            x, weight, out, seq_len, 2048, 2048, 64, 64, 64, group, False,
+            num_warps=4, num_stages=3
+        )
+        return
+    seq_len = x.shape[0]
+    matmul_small_res[((seq_len + 127) // 128) * (2048 // 64),](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 2048,
+        hidden = 2048,
+        BLOCK_SIZE_N = 128,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 64
+    )
+
+@pdl_kernel
+@triton.jit
+def matmul_packed_gate(
+    inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr,
+    GROUP_M : tl.constexpr = 1,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    grid_n = tl.cdiv(hidden, BLOCK_SIZE_M)
+    if GROUP_M == 1:
+        pm = pid // grid_n
+        pn = pid % grid_n
+    else:
+        group = pid // (GROUP_M * grid_n)
+        first_m = group * GROUP_M
+        group_m = tl.minimum(grid_m - first_m, GROUP_M)
+        pm = first_m + pid % group_m
+        pn = pid % (GROUP_M * grid_n) // group_m
+    rows = pm * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    cols = pn * (2 * BLOCK_SIZE_M) + tl.arange(0, 2 * BLOCK_SIZE_M)
+    kk = tl.arange(0, BLOCK_SIZE_K)
+    acc = tl.zeros((BLOCK_SIZE_N, 2 * BLOCK_SIZE_M), tl.float32)
+    for k in range(tl.cdiv(features, BLOCK_SIZE_K)):
+        ks = k * BLOCK_SIZE_K + kk
+        a = tl.load(inp_ptr + rows[:, None] * features + ks[None, :], mask=(rows[:, None] < seq_len) & (ks[None, :] < features), other=0)
+        b = tl.load(weight_ptr + ks[:, None] * (2 * hidden) + cols[None, :], mask=(ks[:, None] < features) & (cols[None, :] < 2 * hidden), other=0)
+        acc = tl.dot(a, b, acc)
+    gate, up = tl.split(acc.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M, 2))
+    gate = gate * tl.sigmoid(1.5957691216057308 * gate * (1 + 0.044715 * gate * gate))
+    out = (gate * up).to(tl.bfloat16)
+    output_cols = pn * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    tl.store(out_ptr + rows[:, None] * hidden + output_cols[None, :], out, mask=(rows[:, None] < seq_len) & (output_cols[None, :] < hidden))
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_grouped_res(
+    inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr,
+    GROUP_M : tl.constexpr, TRANSPOSED : tl.constexpr,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    gm = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    gn = tl.cdiv(hidden, BLOCK_SIZE_M)
+    for pid in range(tl.program_id(0), gm * gn, tl.num_programs(0)):
+        group = pid // (GROUP_M * gn)
+        first = group * GROUP_M
+        size = tl.minimum(gm - first, GROUP_M)
+        mi = first + pid % (GROUP_M * gn) % size
+        ni = pid % (GROUP_M * gn) // size
+        r = mi * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c = ni * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        kk = tl.arange(0, BLOCK_SIZE_K)
+        acc = tl.load(out_ptr + r[:, None] * hidden + c[None, :], r[:, None] < seq_len, other=0.0).to(tl.float32)
+        for off in range(0, features, BLOCK_SIZE_K):
+            a = tl.load(inp_ptr + r[:, None] * features + off + kk[None, :], r[:, None] < seq_len, other=0.0)
+            if TRANSPOSED:
+                w = tl.trans(tl.load(weight_ptr + c[:, None] * features + off + kk[None, :]))
+            else:
+                w = tl.load(weight_ptr + (off + kk[:, None]) * hidden + c[None, :])
+            acc = tl.dot(a, w, acc)
+        tl.store(out_ptr + r[:, None] * hidden + c[None, :], acc.to(tl.bfloat16), r[:, None] < seq_len)
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def scaled_matmul_grouped_gate(
+    inp_ptr, factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr,
+    GROUP_M : tl.constexpr,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    gm = tl.cdiv(seq_len, BLOCK_SIZE_N)
+    gn = tl.cdiv(4096, BLOCK_SIZE_M)
+    for pid in range(tl.program_id(0), gm * gn, tl.num_programs(0)):
+        group = pid // (GROUP_M * gn)
+        first = group * GROUP_M
+        size = tl.minimum(gm - first, GROUP_M)
+        mi = first + pid % (GROUP_M * gn) % size
+        ni = pid % (GROUP_M * gn) // size
+        r = mi * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c = ni * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        kk = tl.arange(0, BLOCK_SIZE_K)
+        factor = tl.load(factor_ptr + r, r < seq_len, other=0.0)
+        acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), tl.float32)
+        up = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), tl.float32)
+        for off in range(0, 1024, BLOCK_SIZE_K):
+            a = tl.load(inp_ptr + r[:, None] * 1024 + off + kk[None, :], r[:, None] < seq_len, other=0.0)
+            a = a * factor[:, None]
+            w = tl.load(weight1_ptr + (off + kk[:, None]) * 4096 + c[None, :])
+            u = tl.load(weight2_ptr + (off + kk[:, None]) * 4096 + c[None, :])
+            acc = tl.dot(a, w, acc)
+            up = tl.dot(a, u, up)
+        gate = acc
+        gate = gate * tl.sigmoid(1.5957691216057308 * gate * (1.0 + 0.044715 * gate * gate))
+        tl.store(out_ptr + r[:, None] * 4096 + c[None, :], (gate * up).to(tl.bfloat16), r[:, None] < seq_len)
+    pdl_trigger(USE_PDL)
+
+@pdl_kernel
+@triton.jit
+def matmul_encoder_kv_rope(
+    inp_ptr, weight_QKV_ptr, rope_weights_ptr, K_ptr, V_ptr, seq_len : tl.constexpr, features : tl.constexpr,
+    head_dim : tl.constexpr, num_head : tl.constexpr,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    BLOCK_SIZE_N: tl.constexpr = 64
+    BLOCK_SIZE_M: tl.constexpr = 64
+    BLOCK_SIZE_K: tl.constexpr = 64
+    pid1 = tl.program_id(axis=0)
+    psize1 = tl.num_programs(axis=0)
+    pid2 = tl.program_id(axis=1)
+    psize2 = tl.num_programs(axis=1)
+    for i in range(pid1 * BLOCK_SIZE_N, seq_len, psize1 * BLOCK_SIZE_N):
+        for j in range(num_head * head_dim + pid2 * BLOCK_SIZE_M, (num_head + 2) * head_dim, psize2 * BLOCK_SIZE_M):
+            acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+            for k in range(0, features, BLOCK_SIZE_K):
+                x = tl.load(inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), mask=tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i, other=0.0)
+                w = tl.load(weight_QKV_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * ((num_head + 2) * head_dim) + j + tl.arange(0, BLOCK_SIZE_M))
+                acc = tl.dot(x, w, acc)
+            acc = acc.to(tl.bfloat16)
+            if j < (num_head + 1) * head_dim:
+                x0, x1 = tl.split(acc.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M // 2, 2))
+                x_cossin = tl.load(rope_weights_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * head_dim + j % head_dim + tl.arange(0, BLOCK_SIZE_M)[None, :], mask=tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i, other=0.0)
+                x_cos, x_sin = tl.split(x_cossin.reshape(BLOCK_SIZE_N, BLOCK_SIZE_M // 2, 2))
+                x0_ = x0 * x_cos - x1 * x_sin
+                x1_ = x1 * x_cos + x0 * x_sin
+                acc = tl.interleave(x0_, x1_)
+                out_ptr = K_ptr
+            else:
+                out_ptr = V_ptr
+            out_stride = head_dim
+            tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * out_stride + j % out_stride + tl.arange(0, BLOCK_SIZE_M), acc, mask=tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len - i)
+    pdl_trigger(USE_PDL)
+
+def rms_matmul_packed_gate(x, weight, out, x_norm, tile):
+    seq_len = x.shape[0]
+    block_n, block_m, block_k, warps, stages = tile
+    rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
+    matmul_packed_gate[(triton.cdiv(seq_len, block_n) * triton.cdiv(16384, block_m),)](
+        x_norm, weight, out, seq_len, 2048, 16384,
+        block_n, block_m, block_k, min(8, triton.cdiv(seq_len, block_n)),
+        num_warps=warps, num_stages=stages
+    )
+
+
+def transformer_encoder(weights, buffers, encoder_seq_len):
+    layer_norm_matmul_n256_1152_2048_bias(
+        buffers['vision_x'],
+        weights['vision_final_norm_w'], 
+        weights['vision_final_norm_b'],
+        weights['encoder_multi_modal_projector_w'],
+        weights['encoder_multi_modal_projector_b'],
+        buffers['encoder_x'],
+        buffers['vision_x_norm']
+    )
+    for i in range(18):
+        if buffers.get('optimized', False) and i == 17:
+            rms_norm_kernel[(encoder_seq_len,)](
+                buffers['encoder_x'], buffers['encoder_x_norm'], encoder_seq_len, 2048
+            )
+            matmul_encoder_kv_rope[(triton.cdiv(encoder_seq_len, 64), 8)](
+                buffers['encoder_x_norm'], weights['encoder_attn_qkv_w'][i],
+                buffers['encoder_rope_weights'], buffers['encoder_K'][i, :encoder_seq_len],
+                buffers['encoder_V'][i, :encoder_seq_len], encoder_seq_len, 2048, 256, 8
+            )
+        else:
+            rms_matmul_n_2048_2560_qkv_rope(
+                buffers['encoder_x'],
+                weights['encoder_attn_qkv_w'][i],
+                buffers['encoder_rope_weights'],
+                buffers['encoder_Q'],
+                buffers['encoder_K'][i, :encoder_seq_len],
+                buffers['encoder_V'][i, :encoder_seq_len],
+                buffers['encoder_x_norm']
+            )
+        if 'encoder_events' in buffers:
+            buffers['encoder_events'][i].record()
+
+        if i != 17:
+            scale = 1.0 / (256 ** 0.5)
+            attn = AttnSingleKey(buffers['encoder_Q'], buffers['encoder_K'][i, :encoder_seq_len], buffers['encoder_V'][i, :encoder_seq_len], scale)
+            
+            matmul_n_2048_2048_res(
+                attn,
+                weights['encoder_attn_o_w'][i],
+                buffers['encoder_x'],
+                group=(2 if encoder_seq_len == 512 else 4) if buffers.get('optimized', False) else None,
+            )
+
+            if buffers.get('optimized', False):
+                rms_matmul_packed_gate(
+                    buffers['encoder_x'], weights['encoder_ffn_packed_w'][i],
+                    buffers['encoder_hidden'], buffers['encoder_x_norm'],
+                    (64, 64, 64, 4, 3) if encoder_seq_len == 512 else (128, 32, 32, 4, 3)
+                )
+            else:
+                rms_matmul_n_2048_16384_gate(
+                    buffers['encoder_x'],
+                    weights['encoder_ffn_gate_w'][i],
+                    weights['encoder_ffn_up_w'][i],
+                    buffers['encoder_hidden'],
+                    buffers['encoder_x_norm']
+                )
+
+            matmul_n_16384_2048_res(
+                buffers['encoder_hidden'],
+                weights['encoder_ffn_down_w'][i],
+                buffers['encoder_x'],
+                group=4 if buffers.get('optimized', False) else None,
+            )
+
+@pdl_kernel
+@triton.jit
+def matvec_bias_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, features : tl.constexpr, hidden : tl.constexpr, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+
+    BLOCK_SIZE_N : tl.constexpr = 32
+    BLOCK_SIZE_M : tl.constexpr = 8
+    for j in range(pid * BLOCK_SIZE_M, hidden, psize * BLOCK_SIZE_M):
+        acc = tl.load(bias_ptr + j + tl.arange(0, BLOCK_SIZE_M)).to(tl.float32)
+        for k in range(0, features, BLOCK_SIZE_N):
+            x = tl.load(x_ptr + k + tl.arange(0, BLOCK_SIZE_N), mask = (k + tl.arange(0, BLOCK_SIZE_N) < features), other = 0.0)
+            w = tl.load(
+                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+                mask = (k + tl.arange(0, BLOCK_SIZE_N)[:, None] < features) & (j + tl.arange(0, BLOCK_SIZE_M)[None, :] < hidden),
+                other = 0.0
+            )
+            acc += tl.sum(x[:, None] * w, axis=0)
+        tl.store(out_ptr + j + tl.arange(0, BLOCK_SIZE_M), acc.to(tl.bfloat16), mask = j + tl.arange(0, BLOCK_SIZE_M) < hidden)
+    pdl_trigger(USE_PDL)
+
+def matmul_1_32_1024_bias(x, weight, bias, out):
+    matvec_bias_kernel[((1024 + 7)//8, )](
+        x,
+        weight,
+        bias,
+        out,
+        features = 32,
+        hidden = 1024
+    )
+
+def matmul_k_32_1024_bias_silu(x, weight, bias, out):
+    seq_len = x.shape[0]
+    matmul_small_bias_silu[((seq_len + 31) // 32) * (1024 // 32),] (
+        x, weight, out, bias,
+        seq_len = seq_len,
+        features = 32,
+        hidden = 1024,
+        BLOCK_SIZE_N = 32,
+        BLOCK_SIZE_M = 32,
+        BLOCK_SIZE_K = 32
+    )
+
+def matmul_k_1024_1024_bias(x, weight, bias, out):
+    seq_len = x.shape[0]
+    matmul_small_bias[((seq_len + 31) // 32) * (1024 // 32),] (
+        x, weight, out, bias,
+        seq_len = seq_len,
+        features = 1024,
+        hidden = 1024,
+        BLOCK_SIZE_N = 32,
+        BLOCK_SIZE_M = 32,
+        BLOCK_SIZE_K = 64
+    )
+
+@pdl_kernel
+@triton.jit
+def rmsnorm_factor_kernel(inp_ptr, factor_ptr, rows: tl.constexpr, features: tl.constexpr, eps: tl.constexpr = 1e-6, BLOCK_SIZE: tl.constexpr = 1024, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(axis=0)
+    psize = tl.num_programs(axis=0)
+
+    for i in range(pid, rows, psize):
+        sum_x = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for j in range(0, features, BLOCK_SIZE):
+            offs = j + tl.arange(0, BLOCK_SIZE)
+            x = tl.load(inp_ptr + i * features + offs, mask=offs < features, other=0.0)
+            sum_x += x * x
+        factor = tl.rsqrt(tl.sum(sum_x) / features + eps)
+        tl.store(factor_ptr + i, factor)
+    pdl_trigger(USE_PDL)
+
+def rms_matmul_k_1024_32_bias_res(x, weight, bias, out, x_norm_factor):
+    seq_len = x.shape[0]
+    rmsnorm_factor_kernel[(seq_len,)](x, x_norm_factor, seq_len, 1024, eps=1e-6, BLOCK_SIZE=1024)
+    scaled_matmul_small_bias_res[((seq_len + 15) // 16) * (32 // 16),] (
+        x, x_norm_factor, weight, out, bias, out,
+        seq_len = seq_len,
+        features = 1024,
+        hidden = 32,
+        BLOCK_SIZE_N = 16,
+        BLOCK_SIZE_M = 16,
+        BLOCK_SIZE_K = 256
+    )
+
+@pdl_kernel
+@triton.jit
+def scaled_matmul_rope_qkv(
+    inp_ptr, inp_norm_factor_ptr, seq_len: tl.constexpr, features: tl.constexpr, head_dim: tl.constexpr, num_heads: tl.constexpr,
+    weight_qkv_ptr, rope_weights_ptr, q_ptr, k_ptr, v_ptr,
+    BLOCK_SIZE_M : tl.constexpr = 64, BLOCK_SIZE_N : tl.constexpr = 32, BLOCK_SIZE_K : tl.constexpr = 64,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(axis=0)
+    psize = tl.num_programs(axis=0)
+    
+    grid_m = triton.cdiv(seq_len, BLOCK_SIZE_M)
+    grid_n = triton.cdiv((num_heads + 2) * head_dim, BLOCK_SIZE_N)
+
+    assert head_dim % BLOCK_SIZE_N == 0, f"head_dim {head_dim} must be divisible by BLOCK_SIZE_N {BLOCK_SIZE_N}"
+
+    while pid < grid_m * grid_n:
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
+        start_i = pid_m * BLOCK_SIZE_M
+        start_j = pid_n * BLOCK_SIZE_N
+        offs_i = start_i + tl.arange(0, BLOCK_SIZE_M)[:, None]
+        offs_j = start_j + tl.arange(0, BLOCK_SIZE_N)[None, :]
+
+        norm_factor = tl.load(
+            inp_norm_factor_ptr + start_i + tl.arange(0, BLOCK_SIZE_M),
+            mask = start_i + tl.arange(0, BLOCK_SIZE_M) < seq_len, other=0
+        )
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, features, BLOCK_SIZE_K):
+            offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+            x = tl.load(
+                inp_ptr + offs_i * features + offs_k[None, :],
+                mask = (offs_k[None, :] < features) & (offs_i < seq_len), other = 0
+            )
+            # x = x * norm_factor[:, None]
+            w = tl.load(
+                weight_qkv_ptr + offs_k[:, None] * ((num_heads + 2) * head_dim) + offs_j,
+                mask = offs_k[:, None] < features, other = 0
+            )
+            accumulator = tl.dot(x, w, accumulator)
+        accumulator = accumulator * norm_factor[:, None]
+        
+        if start_j < (num_heads + 1) * head_dim:
+            x0, x1 = tl.split(accumulator.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+            x_cossin = tl.load(rope_weights_ptr + offs_i * head_dim + offs_j % head_dim, mask = offs_i < seq_len, other = 0)
+            x_cos, x_sin = tl.split(x_cossin.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+            x0_ = x0 * x_cos - x1 * x_sin
+            x1_ = x1 * x_cos + x0 * x_sin
+            accumulator = tl.interleave(x0_, x1_)
+        
+        accumulator = accumulator.to(tl.bfloat16)
+
+        if start_j < num_heads * head_dim:
+            out_ptr = q_ptr
+            out_stride = num_heads * head_dim
+        elif start_j < (num_heads + 1) * head_dim:
+            out_ptr = k_ptr
+            out_stride = head_dim
+        else:
+            out_ptr = v_ptr
+            out_stride = head_dim
+        tl.store(
+            out_ptr + offs_i * out_stride + offs_j % out_stride,
+            accumulator,
+            mask = (offs_i < seq_len) & (offs_j < (num_heads + 2) * head_dim)
+        )
+        pid += psize
+    pdl_trigger(USE_PDL)
+
+def rms_matmul_k_1024_2560_qkv_rope(x, weight_qkv, rope_weight, Q, K, V, x_norm_factor, optimized=False):
+    if optimized:
+        seq_len = x.shape[0]
+        rmsnorm_factor_kernel[(seq_len,)](x, x_norm_factor, seq_len, 1024, eps=1e-6, BLOCK_SIZE=1024)
+        scaled_matmul_rope_qkv[(triton.cdiv(seq_len, 32) * (2560 // 32),)](
+            x, x_norm_factor, seq_len, 1024, 256, 8, weight_qkv, rope_weight, Q, K, V,
+            BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=128, num_warps=4, num_stages=3
+        )
+        return
+    seq_len = x.shape[0]
+    rmsnorm_factor_kernel[(128,)](x, x_norm_factor, seq_len, 1024, eps=1e-6, BLOCK_SIZE=1024)
+    scaled_matmul_rope_qkv[(128,)](
+        x, x_norm_factor, seq_len, 1024, 256, 8,
+        weight_qkv, rope_weight, Q, K, V,
+    )
+
+@pdl_kernel
+@triton.jit
+def matmul_abT_scale(
+    q_ptr, k_ptr, out_ptr, M : tl.constexpr, N : tl.constexpr, K : tl.constexpr,
+    scale_factor: tl.constexpr,
+    BLOCK_SIZE_M : tl.constexpr = 32, BLOCK_SIZE_N : tl.constexpr = 32, BLOCK_SIZE_K : tl.constexpr = 64,
+    USE_PDL : tl.constexpr = False,
+):
+    pdl_wait(USE_PDL)
+    pid = tl.program_id(axis=0)
+    psize = tl.num_programs(axis=0)
+    grid_m = triton.cdiv(M, BLOCK_SIZE_M)
+    grid_n = triton.cdiv(N, BLOCK_SIZE_N)
+
+    while pid < grid_m * grid_n:
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
+        offs_i = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_j = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, K, BLOCK_SIZE_K):
+            offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+            x = tl.load(q_ptr + offs_i[:, None] * K + offs_k[None, :], mask = offs_k[None, :] < K, other = 0)
+            w = tl.load(k_ptr + offs_j[:, None] * K + offs_k[None, :], mask = offs_k[None, :] < K, other = 0)
+            accumulator = tl.dot(x, tl.trans(w), accumulator)
+        accumulator = accumulator * scale_factor
+        tl.store(out_ptr + offs_i[:, None] * N + offs_j[None, :], accumulator.to(tl.bfloat16),
+                 mask = (offs_i[:, None] < M) & (offs_j[None, :] < N))
+        pid += psize
+    pdl_trigger(USE_PDL)
+
+
+@pdl_kernel
+@triton.jit
+def softmax_kernel_mask0(
+    inp_ptr, queries : tl.constexpr, keys : tl.constexpr,
+    num_heads : tl.constexpr, encoder_seq_len : tl.constexpr,
+    out_ptr, BLOCK_SIZE_M: tl.constexpr = 4, BLOCK_SIZE: tl.constexpr = 1024, USE_PDL : tl.constexpr = False):
+    pdl_wait(USE_PDL)
+
+    pid = tl.program_id(axis=0)
+    psize = tl.num_programs(axis=0)
+
+    assert BLOCK_SIZE >= queries, f"BLOCK_SIZE must be >= N, got {BLOCK_SIZE} < {queries}"
+
+    for i in range(pid * BLOCK_SIZE_M, queries, psize * BLOCK_SIZE_M):
+        offs_i = i + tl.arange(0, BLOCK_SIZE_M)[:, None]
+        offs_j = tl.arange(0, BLOCK_SIZE)[None, :]
+        
+        attn_mask = (offs_i < queries) & (offs_j < keys)
+        attn_mask = attn_mask & ((offs_i >= num_heads) | (offs_j <= encoder_seq_len))
+        vals = tl.load(inp_ptr + offs_i * keys + offs_j,
+                       mask = attn_mask, other = -float('inf'))
+        vals = tl.exp(vals - tl.max(vals, axis=1, keep_dims=True))
+        vsum = tl.sum(vals, axis=1, keep_dims=True, dtype=tl.float32)
+        vals = vals / vsum
+        vals = vals.to(tl.bfloat16)
+        tl.store(
+            out_ptr + offs_i * keys + offs_j, vals,
+            mask = (offs_i < queries) & (offs_j < keys)
+        )
+    pdl_trigger(USE_PDL)
+
+def matmul_k8_256_n_softmax_mask0(Q, K, out, encoder_seq_len, optimized=False):
+    if optimized:
+        total_queries, total_keys = Q.shape[0], K.shape[0]
+        block_m = 32 if encoder_seq_len == 512 else 64
+        stages = 4 if encoder_seq_len == 512 else 3
+        matmul_abT_scale[(triton.cdiv(total_queries, block_m) * triton.cdiv(total_keys, 64),)](
+            Q, K, out, total_queries, total_keys, 256, 256 ** -0.5,
+            BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+            num_warps=4, num_stages=stages
+        )
+        softmax_kernel_mask0[(total_queries,)](
+            out, total_queries, total_keys, 8, encoder_seq_len, out,
+            BLOCK_SIZE_M=1, BLOCK_SIZE=1024, num_warps=4
+        )
+        return
+    total_queries = Q.shape[0]
+    total_keys = K.shape[0]
+    head_dim = 256
+    matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](Q, K, out,
+        total_queries, total_keys, head_dim, head_dim ** -0.5,
+        BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64)
+    softmax_kernel_mask0[((total_queries + 3) // 4,)](out,
+        total_queries, total_keys, 8, encoder_seq_len, out,
+        BLOCK_SIZE_M=4, BLOCK_SIZE=1024)
+
+def matmul_k8_n_256(x, V, out, tile=None):
+    if tile is not None:
+        seq_len, features = x.shape
+        block_n, block_m, block_k, warps, stages = tile
+        matmul_small[(triton.cdiv(seq_len, block_n) * triton.cdiv(256, block_m),)](
+            x, V, out, seq_len, features, 256,
+            BLOCK_SIZE_N=block_n, BLOCK_SIZE_M=block_m, BLOCK_SIZE_K=block_k,
+            num_warps=warps, num_stages=stages
+        )
+        return
+    total_queries = x.shape[0]
+    total_keys = V.shape[0]
+    head_dim = 256
+    matmul_small[((total_keys + 31) // 32) * (head_dim // 32),](
+        x, V, out,
+        seq_len = total_queries,
+        features = total_keys,
+        hidden = head_dim,
+        BLOCK_SIZE_N = 32,
+        BLOCK_SIZE_M = 32,
+        BLOCK_SIZE_K = 64
+    )
+
+def matmul_k_2048_1024_res(x, weight, out, transposed=False):
+    if transposed:
+        seq_len = x.shape[0]
+        matmul_grouped_res[(triton.cdiv(seq_len, 16) * (1024 // 32),)](
+            x, weight, out, seq_len, 2048, 1024, 16, 32, 256, 2, True,
+            num_warps=4, num_stages=4
+        )
+        return
+    seq_len = x.shape[0]
+    matmul_small_res[(128,)](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 2048,
+        hidden = 1024,
+        BLOCK_SIZE_N = 32,
+        BLOCK_SIZE_M = 32,
+        BLOCK_SIZE_K = 128
+    )
+
+def rms_matmul_k_1024_4096_gate(x, weight1, weight2, out, x_norm_factor, optimized=False):
+    if optimized:
+        seq_len = x.shape[0]
+        rmsnorm_factor_kernel[(seq_len,)](x, x_norm_factor, seq_len, 1024, eps=1e-6, BLOCK_SIZE=1024)
+        scaled_matmul_grouped_gate[(triton.cdiv(seq_len, 32) * (4096 // 64),)](
+            x, x_norm_factor, weight1, weight2, out, seq_len,
+            32, 64, 64, 2, num_warps=4, num_stages=3
+        )
+        return
+    seq_len = x.shape[0]
+    rmsnorm_factor_kernel[(128,)](x, x_norm_factor, seq_len, 1024, eps=1e-6, BLOCK_SIZE=1024)
+    scaled_matmul_small_gate[(128,)] (
+        x, x_norm_factor, weight1, weight2, out,
+        seq_len = seq_len,
+        features = 1024,
+        hidden = 4096,
+        BLOCK_SIZE_N = 64,
+        BLOCK_SIZE_M = 64,
+        BLOCK_SIZE_K = 64
+    )
+
+def matmul_k_4096_1024_res(x, weight, out, optimized=False):
+    if optimized:
+        seq_len = x.shape[0]
+        matmul_grouped_res[(triton.cdiv(seq_len, 16) * (1024 // 32),)](
+            x, weight, out, seq_len, 4096, 1024, 16, 32, 256, 2, False,
+            num_warps=4, num_stages=4
+        )
+        return
+    seq_len = x.shape[0]
+    matmul_small_res[(((seq_len + 15) // 16) * (1024 // 32),)](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 4096,
+        hidden = 1024,
+        BLOCK_SIZE_N = 16,
+        BLOCK_SIZE_M = 32,
+        BLOCK_SIZE_K = 256
+    )
+
+def transformer_decoder(weights, buffers, encoder_seq_len):
+    matmul_1_32_1024_bias(
+        buffers['observation_state_normalized'],
+        weights['decoder_state_in_proj_w'],
+        weights['decoder_state_in_proj_b'],
+        buffers['decoder_state_buf']
+    )
+    for step in range(10):
+        buffers['decoder_x'][:1].copy_(buffers['decoder_state_buf'])
+        matmul_k_32_1024_bias_silu(
+            buffers['diffusion_noise'],
+            weights['decoder_action_fused_in_proj_w'],
+            weights['decoder_action_fused_time_biases'][step%10],
+            buffers['decoder_x_buf']
+        )
+        matmul_k_1024_1024_bias(
+            buffers['decoder_x_buf'],
+            weights['decoder_action_mlp_w'],
+            weights['decoder_action_mlp_b'],
+            buffers['decoder_x'][1:]
+        )
+        for i in range(18):
+            rms_matmul_k_1024_2560_qkv_rope(
+                buffers['decoder_x'], weights['decoder_attn_qkv_w'][i],
+                buffers['decoder_rope_weights'],
+                buffers['decoder_q_buf'],
+                buffers['encoder_K'][i][encoder_seq_len:],
+                buffers['encoder_V'][i][encoder_seq_len:],
+                buffers['decoder_norm_factor_buf'],
+                optimized=buffers.get('optimized', False),
+            )
+            if step == 0 and 'encoder_events' in buffers:
+                torch.cuda.current_stream().wait_event(buffers['encoder_events'][i])
+            matmul_k8_256_n_softmax_mask0(
+                buffers['decoder_q_buf'],
+                buffers['encoder_K'][i],
+                buffers['decoder_attn_buf'],
+                encoder_seq_len,
+                optimized=buffers.get('optimized', False),
+            )
+            matmul_k8_n_256(
+                buffers['decoder_attn_buf'],
+                buffers['encoder_V'][i],
+                buffers['decoder_q_buf'],
+                tile=(32, 32, 64, 4, 4) if buffers.get('optimized', False) else None,
+            )
+
+            matmul_k_2048_1024_res(
+                buffers['decoder_q_buf'].view(-1, 2048),
+                weights['decoder_attn_o_packed_w'][i] if buffers.get('optimized', False) else weights['decoder_attn_o_w'][i],
+                buffers['decoder_x'],
+                transposed=buffers.get('optimized', False),
+            )
+            rms_matmul_k_1024_4096_gate(
+                buffers['decoder_x'],
+                weights['decoder_ffn_gate_w'][i],
+                weights['decoder_ffn_up_w'][i],
+                buffers['decoder_hidden'],
+                buffers['decoder_norm_factor_buf'],
+                optimized=buffers.get('optimized', False),
+            )
+            matmul_k_4096_1024_res(
+                buffers['decoder_hidden'],
+                weights['decoder_ffn_down_w'][i],
+                buffers['decoder_x'],
+                optimized=buffers.get('optimized', False),
+            )
+        rms_matmul_k_1024_32_bias_res(
+            buffers['decoder_x'][1:],
+            weights['decoder_action_fused_out_proj_w'],
+            weights['decoder_action_fused_out_proj_b'],
+            buffers['diffusion_noise'],
+            buffers['decoder_norm_factor_buf'],
+        )
+
+def pi0_model(weights, buffers, num_views):
+    encoder_seq_len = buffers['encoder_x'].shape[0]
+    vision_encoder(weights, buffers, num_views)
+    transformer_encoder(weights, buffers, encoder_seq_len)
+    transformer_decoder(weights, buffers, encoder_seq_len)
+
+class Pi0Inference:
+    def __init__(self, checkpoint, num_views, chunk_size, optimized=True):
+        self.num_views = num_views
+        self.chunk_size = chunk_size
+        encoded_prompt = checkpoint['language_embeds']
+        self.prompt_len = len(encoded_prompt)
+
+        self.weights = {
+            "vision_patch_embedding_w":           torch.empty(14, 14, 3, 1152,        dtype = torch.bfloat16, device = "cuda"),
+            "vision_patch_embedding_b":           torch.empty(1152,                   dtype = torch.bfloat16, device = "cuda"),
+            "vision_position_embedding":          torch.empty(256, 1152,              dtype = torch.bfloat16, device = "cuda"),
+            "vision_attn_qkv_w":                  torch.empty(27, 1152, 3 * 1152,     dtype = torch.bfloat16, device = "cuda"),
+            "vision_attn_qkv_b":                  torch.empty(27, 3 * 1152,           dtype = torch.bfloat16, device = "cuda"),
+            "vision_attn_o_w":                    torch.empty(27, 1152, 1152,         dtype = torch.bfloat16, device = "cuda"),
+            "vision_attn_o_b":                    torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_ffn_up_w":                    torch.empty(27, 1152, 4304,         dtype = torch.bfloat16, device = "cuda"),
+            "vision_ffn_up_b":                    torch.empty(27, 4304,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_ffn_down_w":                  torch.empty(27, 4304, 1152,         dtype = torch.bfloat16, device = "cuda"),
+            "vision_ffn_down_b":                  torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_pre_attn_norm_w":             torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_pre_attn_norm_b":             torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_pre_ffn_norm_w":              torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_pre_ffn_norm_b":              torch.empty(27, 1152,               dtype = torch.bfloat16, device = "cuda"),
+            "vision_final_norm_w":                torch.empty(1152,                   dtype = torch.bfloat16, device = "cuda"),
+            "vision_final_norm_b":                torch.empty(1152,                   dtype = torch.bfloat16, device = "cuda"),
+
+            "encoder_multi_modal_projector_w":    torch.empty(1152, 2048,             dtype = torch.bfloat16, device = "cuda"),
+            "encoder_multi_modal_projector_b":    torch.empty(2048,                   dtype = torch.bfloat16, device = "cuda"),
+            "encoder_attn_qkv_w":                 torch.empty(18, 2048, 2560,         dtype = torch.bfloat16, device = "cuda"),
+            "encoder_attn_o_w":                   torch.empty(18, 2048, 2048,         dtype = torch.bfloat16, device = "cuda"),
+            "encoder_ffn_gate_w":                 torch.empty(18, 2048, 16384,        dtype = torch.bfloat16, device = "cuda"),
+            "encoder_ffn_up_w":                   torch.empty(18, 2048, 16384,        dtype = torch.bfloat16, device = "cuda"),
+            "encoder_ffn_down_w":                 torch.empty(18, 16384, 2048,        dtype = torch.bfloat16, device = "cuda"),
+
+            "decoder_state_in_proj_w":            torch.empty(32, 1024,               dtype = torch.bfloat16, device = "cuda"),
+            "decoder_state_in_proj_b":            torch.empty(1024,                   dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_fused_in_proj_w":     torch.empty(32, 1024,               dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_fused_time_biases":   torch.empty(10, 1024,               dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_mlp_w":               torch.empty(1024, 1024,             dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_mlp_b":               torch.empty(1024,                   dtype = torch.bfloat16, device = "cuda"),
+            "decoder_attn_qkv_w":                 torch.empty(18, 1024, 2560,         dtype = torch.bfloat16, device = "cuda"),
+            "decoder_attn_o_w":                   torch.empty(18, 2048, 1024,         dtype = torch.bfloat16, device = "cuda"),
+            "decoder_ffn_gate_w":                 torch.empty(18, 1024, 4096,         dtype = torch.bfloat16, device = "cuda"),
+            "decoder_ffn_up_w":                   torch.empty(18, 1024, 4096,         dtype = torch.bfloat16, device = "cuda"),
+            "decoder_ffn_down_w":                 torch.empty(18, 4096, 1024,         dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_fused_out_proj_w":    torch.empty(1024, 32,               dtype = torch.bfloat16, device = "cuda"),
+            "decoder_action_fused_out_proj_b":    torch.empty(32,                     dtype = torch.bfloat16, device = "cuda"),
+
+            "language_embeds": torch.empty(self.prompt_len, 2048,  dtype = torch.bfloat16, device = "cuda"),
+        }
+
+        encoder_seq_len = num_views * 256 + self.prompt_len
+        decoder_seq_len = chunk_size + 1
+
+        self.buffers = {
+            'observation_images_normalized':      torch.empty(num_views, 224, 224,3,           dtype=torch.bfloat16,   device = "cuda"),
+            'observation_state_normalized':       torch.empty(32,                              dtype = torch.bfloat16, device = "cuda"),
+            'diffusion_noise':                    torch.empty(chunk_size, 32,                  dtype = torch.bfloat16, device = "cuda"),
+            'vision_x':                           torch.empty(num_views, 256, 1152,            dtype = torch.bfloat16, device = "cuda"),
+            'vision_x_norm':                      torch.empty(num_views, 256, 1152,            dtype = torch.bfloat16, device = "cuda"),
+            'vision_QKV':                         torch.empty(num_views, 256, 3 * 1152,        dtype = torch.bfloat16, device = "cuda"),
+            'vision_hidden':                      torch.empty(num_views, 256, 4304,            dtype = torch.bfloat16, device = "cuda"),
+            'vision_x_split_k_buf':               torch.empty((num_views * 256 * 1152 * 4,),   dtype = torch.float32, device = "cuda"),
+            'encoder_rope_weights':               torch.empty(encoder_seq_len, 256,            dtype = torch.bfloat16, device = "cuda"),
+            'encoder_x':                          torch.empty(encoder_seq_len, 2048,           dtype = torch.bfloat16, device = "cuda"),
+            'encoder_x_norm':                     torch.empty(encoder_seq_len, 2048,           dtype = torch.bfloat16, device = "cuda"),
+            'encoder_K':                          torch.empty(18, encoder_seq_len + decoder_seq_len, 256,   dtype = torch.bfloat16, device = "cuda"),
+            'encoder_V':                          torch.empty(18, encoder_seq_len + decoder_seq_len, 256,   dtype = torch.bfloat16, device = "cuda"),
+            'encoder_Q':                          torch.empty(encoder_seq_len * 8, 256,        dtype = torch.bfloat16, device = "cuda"),
+            'encoder_hidden':                     torch.empty(encoder_seq_len, 16384,          dtype = torch.bfloat16, device = "cuda"),
+            'decoder_rope_weights':               torch.empty(decoder_seq_len, 256,            dtype = torch.bfloat16, device = "cuda"),
+            'decoder_x':                          torch.empty((decoder_seq_len, 1024),         dtype = torch.bfloat16, device = "cuda"),
+            'decoder_x_buf':                      torch.empty((chunk_size, 1024),              dtype = torch.bfloat16, device = "cuda"),
+            'decoder_state_buf':                  torch.empty((1, 1024),                       dtype = torch.bfloat16, device = "cuda"),
+            'decoder_norm_factor_buf':            torch.empty((decoder_seq_len,),              dtype = torch.bfloat16, device = "cuda"),
+            'decoder_q_buf':                      torch.empty((decoder_seq_len * 8, 256),      dtype = torch.bfloat16, device = "cuda"),
+            'decoder_attn_buf':                   torch.empty((decoder_seq_len * 8, encoder_seq_len + decoder_seq_len),  dtype = torch.bfloat16, device = "cuda"),
+            'decoder_hidden':                     torch.empty((decoder_seq_len, 4096),         dtype = torch.bfloat16, device = "cuda"),
+            'decode_split_k_buf':                 torch.empty((2, decoder_seq_len, 1024),      dtype = torch.float32, device = "cuda"),
+        }
+
+        position_ids = torch.arange(encoder_seq_len, device="cuda")
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device="cuda") / 256))
+        k_phase = inv_freq[None, :] * position_ids[:, None]
+        k_cos = torch.cos(k_phase).to(torch.bfloat16)
+        k_sin = torch.sin(k_phase).to(torch.bfloat16)
+        self.buffers['encoder_rope_weights'].copy_(
+            torch.cat([k_cos[:, :, None], k_sin[:, :, None]], 2).view(-1, 256)
+        )
+
+        position_ids = torch.arange(decoder_seq_len, device="cuda") + encoder_seq_len
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device="cuda") / 256))
+        k_phase = inv_freq[None, :] * position_ids[:, None]
+        k_cos = torch.cos(k_phase).to(torch.bfloat16)
+        k_sin = torch.sin(k_phase).to(torch.bfloat16)
+        self.buffers['decoder_rope_weights'].copy_(
+            torch.cat([k_cos[:, :, None], k_sin[:, :, None]], 2).view(-1, 256)
+        )
+
+        for k, v in checkpoint.items():
+            self.weights[k].copy_(v)
+
+        self.optimized = (
+            optimized and torch.cuda.get_device_capability() == (12, 0)
+            and num_views in (2, 3) and chunk_size == 63 and self.prompt_len == 0
+        )
+        self.buffers['optimized'] = self.optimized
+        if self.optimized:
+            self.weights['encoder_ffn_packed_w'] = torch.stack((
+                self.weights['encoder_ffn_gate_w'], self.weights['encoder_ffn_up_w']
+            ), dim=-1).reshape(18, 2048, 32768)
+            self.weights['decoder_attn_o_packed_w'] = self.weights['decoder_attn_o_w'].transpose(1, 2).contiguous()
+            self.buffers['vision_qkv_tile'] = (64, 64, 64, 4, 3) if num_views == 2 else (128, 64, 64, 8, 3)
+            self.encoder_stream = torch.cuda.Stream()
+            self.buffers['encoder_events'] = [torch.cuda.Event() for _ in range(18)]
+
+        self.infer_graph = torch.cuda.CUDAGraph()
+        self.record_infer_graph()
+    
+    def record_run(self):
+        self.buffers['encoder_x'][self.num_views * 256:].copy_(self.weights['language_embeds'])
+        with pdl_scope(self.optimized):
+            if self.optimized:
+                main = torch.cuda.current_stream()
+                self.encoder_stream.wait_stream(main)
+                with torch.cuda.stream(self.encoder_stream):
+                    vision_encoder(self.weights, self.buffers, self.num_views)
+                    transformer_encoder(self.weights, self.buffers, self.buffers['encoder_x'].shape[0])
+                transformer_decoder(self.weights, self.buffers, self.buffers['encoder_x'].shape[0])
+                main.wait_stream(self.encoder_stream)
+            else:
+                pi0_model(self.weights, self.buffers, self.num_views)
+    
+    def record_infer_graph(self):
+        if not self.optimized:
+            for _ in range(3):
+                self.record_run()
+            main = torch.cuda.current_stream()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(main)
+            with torch.cuda.stream(stream):
+                self.infer_graph.capture_begin()
+                self.record_run()
+                self.infer_graph.capture_end()
+            main.wait_stream(stream)
+            return
+        main = torch.cuda.current_stream()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.record_run()
+        stream.synchronize()
+        with torch.cuda.graph(self.infer_graph, stream=stream):
+            self.record_run()
+        main.wait_stream(stream)
+
+    def forward(self, observation_images_normalized, observation_state_normalized, diffusion_noise):
+        self.buffers['observation_images_normalized'].copy_(observation_images_normalized)
+        self.buffers['observation_state_normalized'].copy_(observation_state_normalized)
+        self.buffers['diffusion_noise'].copy_(diffusion_noise)
+        self.infer_graph.replay()
+        return self.buffers['diffusion_noise']

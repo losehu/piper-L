@@ -4,13 +4,15 @@ from pathlib import Path
 import math
 
 
-def select_model(settings,name,root,compile_vpp2=None,pi05_step=None,no_smoothing=False,no_rtc=False):
+def select_model(settings,name,root,compile_vpp2=None,pi05_step=None,no_smoothing=False,no_rtc=False,pi05_backend=None):
+    if name!='pi05' and pi05_backend is not None:raise ValueError('--backend is for pi05 only')
     selected=dict(settings,model_name=name,action_horizon=50,policy_timeout_s=.8,
                   execution_mode='rtc',policy_startup_timeout_s=180)
     if name=='pi05':
         if compile_vpp2:raise ValueError('pi05 uses JAX; --compile is for VPP2 only')
         from rtc_piper.pi05_options import execution_settings
-        return execution_settings(selected,pi05_step,no_smoothing,no_rtc)
+        from rtc_piper.pi05_backend import select
+        return select(execution_settings(selected,pi05_step,no_smoothing,no_rtc),pi05_backend)
     if name!='vpp2':raise ValueError('Model must be pi05 or vpp2')
     if pi05_step is not None or no_smoothing or no_rtc:raise ValueError('These ablation options are for pi05 only')
     options=settings.get('vpp2',{})
