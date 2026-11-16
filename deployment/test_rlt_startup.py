@@ -8,6 +8,28 @@ from rlt_piper.ui_bridge import Endpoint
 from rlt_piper.ui_process import Process
 
 class StartupTests(unittest.TestCase):
+    def test_large_preview_backpressure_preserves_connection_and_heartbeats(self):
+        with tempfile.TemporaryDirectory() as folder:
+            guard=SimpleNamespace(stop=SimpleNamespace(value=0));endpoint=Endpoint(Path(folder)/'s',guard)
+            endpoint.preview=lambda:dict(images=dict(cam0='a'*700000))
+            endpoint.start();conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);conn.settimeout(2);conn.connect(str(endpoint.path))
+            try:
+                # Keep the receiver blocked beyond the old 50ms send timeout.
+                for _ in range(8):conn.sendall(b'{"action":"heartbeat"}\n');time.sleep(.05)
+                self.assertEqual(guard.stop.value,0,endpoint.error)
+                payload=b''
+                while b'\n' not in payload:
+                    conn.sendall(b'{"action":"heartbeat"}\n');payload+=conn.recv(65536)
+                message=json.loads(payload.split(b'\n',1)[0])
+                self.assertEqual(len(message['images']['cam0']),700000)
+                self.assertEqual(guard.stop.value,0,endpoint.error)
+            finally:endpoint.stop.set();conn.close();endpoint.close()
+    def test_unexpected_disconnect_still_latches_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            guard=SimpleNamespace(stop=SimpleNamespace(value=0));endpoint=Endpoint(Path(folder)/'s',guard);endpoint.start()
+            conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);conn.connect(str(endpoint.path));conn.close()
+            endpoint.thread.join(2)
+            self.assertEqual(guard.stop.value,1);self.assertIn('disconnected',endpoint.error);endpoint.close()
     def test_down_can_fails_without_model_or_interface_mutation(self):
         with tempfile.TemporaryDirectory() as folder:
             cfg=Path(folder)/'leader.json';cfg.write_text(json.dumps(dict(adapter_serials=dict(can0='leader'))))
