@@ -6,7 +6,7 @@ from unittest.mock import patch
 import numpy as np
 from rlt_piper.collision import Model,overlap
 from rlt_piper.dual_safety import leader_supervisor
-from rlt_piper.leader_align import Aligner
+from rlt_piper.leader_align import Aligner,software_version
 
 MODEL=Path(__file__).resolve().parents[1]/'rlt_piper/leader_geometry.json'
 if not MODEL.is_file():MODEL=Path(__file__).resolve().parent/'rlt_piper/leader_geometry.json'
@@ -68,7 +68,15 @@ class ProtocolSimulationTests(unittest.TestCase):
             def status(self):
                 if self.role!=0xFC:raise RuntimeError('Not in controlled mode')
             def since(self,cid,after):
-                if cid==0x4AF:return [(version.encode(),after+.0001)]
+                if cid==0x4AF:
+                    if isinstance(version,bytes):raw=version
+                    else:
+                        import re
+                        match=re.fullmatch(r'V(\d)\.(\d)\.(\d)',version)
+                        if match:
+                            raw=bytearray(88);raw[:8]=b'H-V1.2-1';raw[60:68]=('S-V%s.%s-%s'%match.groups()).encode();raw[68:74]=b'260916';raw=bytes(raw)
+                        else:raw=version.encode()
+                    return [(raw[i:i+8],after+.0001+i*.00001) for i in range(0,len(raw),8)]
                 model=Model(MODEL);j=self.query-1
                 return [(bytes([self.query])+struct.pack('>hhH',int(np.degrees(model.upper[j])*10),int(np.degrees(model.lower[j])*10),1000)+b'\0',after+.0001)]
             def send(self,message,timeout):
@@ -98,5 +106,20 @@ class ProtocolSimulationTests(unittest.TestCase):
         align,guard,packets,_=self.simulate('V1.8.4')
         self.assertIsNotNone(align.error);self.assertTrue(guard.stop.value);self.assertFalse(guard.leader_active.value)
         self.assertEqual([cid for cid,_ in packets],[0x4AF])
+    def test_real_leader_response_ignores_hardware_version_and_build_date(self):
+        raw=bytes.fromhex('482d56312e322d3100000000000000003130000000000000000000000000000050697065725f4c5f4d43000000000000333041480000000000000000532d56312e392d31323630393136000031350000de7b000000000000')
+        self.assertEqual(software_version(raw),'S-V1.9-1')
+        align,guard,packets,_=self.simulate(raw)
+        self.assertIsNone(align.error);self.assertEqual(align.phase,'ready');self.assertFalse(guard.stop.value)
+        self.assertFalse({0x150,0x159,0x471}&{cid for cid,_ in packets})
+    def test_incomplete_or_malformed_response_refused_before_motion(self):
+        for raw in [b'H-V1.9-1',bytes(88),b'H-V1.2-1'+bytes(80),b'H-V1.2-1'+bytes(80)+bytes(8)]:
+            with self.subTest(raw=raw):
+                align,guard,packets,_=self.simulate(raw)
+                self.assertIsNotNone(align.error);self.assertTrue(guard.stop.value);self.assertEqual([cid for cid,_ in packets],[0x4AF])
+    def test_new_hardware_cannot_override_old_software(self):
+        raw=bytearray(88);raw[:8]=b'H-V1.9-9';raw[60:68]=b'S-V1.8-4';raw[68:74]=b'261116'
+        align,guard,packets,_=self.simulate(bytes(raw))
+        self.assertIsNotNone(align.error);self.assertEqual([cid for cid,_ in packets],[0x4AF])
 
 if __name__=='__main__':unittest.main()

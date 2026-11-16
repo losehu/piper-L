@@ -9,6 +9,17 @@ import numpy as np
 from rlt_piper.collision import Model
 from rtc_piper.observations import NotReady
 
+def software_version(raw):
+    # Official pyAgxArm get_firmware: eleven 8-byte frames; software is
+    # bytes 60:68. Hardware and production date occupy separate fields.
+    if len(raw)!=88 or not raw.startswith(b'H-V'):raise ValueError('主臂固件响应不完整或帧顺序异常')
+    field=raw[60:68]
+    match=re.fullmatch(rb'S-V(\d)\.(\d)-(\d)',field)
+    if match is None:raise ValueError('主臂软件版本字段无效: '+repr(field))
+    version=tuple(int(v) for v in match.groups())
+    if version[0]!=1 or version<(1,8,5):raise ValueError('主臂软件版本不支持>=1.8.5无缝切换: '+field.decode('ascii'))
+    return field.decode('ascii')
+
 class Aligner:
     def __init__(self,leader,guard):
         self.leader,self.guard=leader,guard;self.model=Model(Path(__file__).with_name('leader_geometry.json'))
@@ -31,10 +42,11 @@ class Aligner:
             time.sleep(min(.01,max(0,until-time.monotonic())))
     def firmware(self):
         after=time.monotonic();self.send(0x4AF,[1,0,0,0,0,0,0,0]);self.pause(.4)
-        parts=self.leader.since(0x4AF,after);text=b''.join(data for data,_ in parts).replace(b'\0',b'').decode('ascii',errors='replace')
-        versions=re.findall(r'[vV](\d+)\.(\d+)[.\-](\d+)',text)
-        if not versions or len(set(versions))!=1 or int(versions[0][0])!=1 or tuple(map(int,versions[0]))<(1,8,5):raise RuntimeError('主臂固件未确认支持>=1.8.5无缝切换；不执行复位或卸力。反馈: '+text)
-        return text
+        parts=self.leader.since(0x4AF,after);raw=b''.join(data for data,_ in parts)
+        try:version=software_version(raw)
+        except ValueError as e:raise RuntimeError(str(e)+'；不执行复位或卸力。反馈(hex): '+raw.hex()) from e
+        print('主臂软件固件已确认：'+version+'（支持无缝切换）。',flush=True)
+        return version
     def limits(self):
         low=[];high=[]
         for joint in range(1,7):
