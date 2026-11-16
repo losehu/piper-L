@@ -72,12 +72,15 @@ class ProtocolSimulationTests(unittest.TestCase):
         clock.sleep=lambda seconds:setattr(clock,'t',clock.t+seconds)
         packets=[];targets=[]
         class Leader:
-            def __init__(self):self.q=np.radians([0,30,-60,0,30,0]);self.error=None;self.role=0xFA;self.query=1;self.bus=self;self.native=False
+            def __init__(self):self.q=np.radians([0,30,-60,0,30,0]);self.desired=self.q.copy();self.updated=clock.t;self.error=None;self.role=0xFA;self.query=1;self.bus=self;self.native=False
+            def advance(self):
+                self.q=self.desired+(self.q-self.desired)*np.exp(-(clock.t-self.updated)/.06);self.updated=clock.t
             def vector(self):
                 if not self.native:raise RuntimeError('Native teaching commands silent until drag restored')
                 if self.role!=0xFA:raise RuntimeError('Native frames unavailable in controlled mode')
+                self.advance()
                 return np.r_[self.q,.04],np.full(4,clock.t+.0001)
-            def feedback(self):return np.r_[self.q,0.],np.full(3,clock.t+.0001)
+            def feedback(self):self.advance();return np.r_[self.q,0.],np.full(3,clock.t+.0001)
             def status(self):
                 if self.role!=0xFC:raise RuntimeError('Not in controlled mode')
             def since(self,cid,after):
@@ -98,8 +101,8 @@ class ProtocolSimulationTests(unittest.TestCase):
                 elif cid==0x191:self.native=True
                 elif cid==0x472:self.query=data[0]
                 elif cid in (0x155,0x156,0x157):
-                    i=(cid-0x155)*2;self.q[i:i+2]=np.radians(np.array(struct.unpack('>ii',data))/1000)
-                    if cid==0x157:targets.append((clock.t,self.q.copy()))
+                    self.advance();i=(cid-0x155)*2;self.desired[i:i+2]=np.radians(np.array(struct.unpack('>ii',data))/1000)
+                    if cid==0x157:targets.append((clock.t,self.desired.copy()))
         leader=Leader();guard=SimpleNamespace(stop=SimpleNamespace(value=0),leader_active=SimpleNamespace(value=0))
         align=Aligner(leader,guard);align.target=np.r_[np.radians([2,31,-61,0,30,0]),.02]
         with patch('rlt_piper.leader_align.time',clock),patch.dict(sys.modules,{'can':SimpleNamespace(Message=lambda **kw:SimpleNamespace(**kw))}):align.run()

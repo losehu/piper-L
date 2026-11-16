@@ -40,6 +40,34 @@ class HilTests(unittest.TestCase):
             now=10+i*.01;state=np.zeros(7);state[0]=np.radians(.3)*np.sin(i*.5)
             h.poll_alignment(state,now)
         self.assertFalse(h.align_started)
+    def test_residual_servo_motion_settles_before_strict_hold_check(self):
+        targets=[];align=SimpleNamespace(error=None,result=None,start=lambda q:targets.append(q.copy()))
+        h=Handover(align);held=np.zeros(7);old=held.copy();old[1]=np.radians(3.035)
+        h.switch(held,None,10,previous_command=old)
+        # The observed failing run crossed 1 degree after just 60ms.
+        for dt,offset in [(0.,0.),(.01,.156),(.02,.315),(.03,.281),(.04,.531),(.05,.736),(.06,.861),(.07,1.032)]:
+            q=held.copy();q[1]=np.radians(offset);self.assertFalse(h.poll_alignment(q,10+dt))
+        self.assertFalse(targets)
+        # A stationary offset alone is insufficient: it must reach the hold target.
+        for dt in np.arange(.08,.5,.01):
+            q=held.copy();q[1]=np.radians(1.032);h.poll_alignment(q,10+dt)
+        self.assertFalse(targets)
+        for dt in np.arange(.5,1.2,.01):h.poll_alignment(held,10+dt)
+        self.assertEqual(len(targets),1);np.testing.assert_array_equal(targets[0],held)
+        q=held.copy();q[1]=np.radians(1.01)
+        with self.assertRaisesRegex(RuntimeError,'保持姿态偏移'):h.poll_alignment(q,11.3)
+    def test_residual_motion_outside_last_command_envelope_stops(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda _:self.fail('Leader started'))
+        h=Handover(align);held=np.zeros(7);old=held.copy();old[1]=np.radians(3)
+        h.switch(held,None,10,previous_command=old)
+        q=held.copy();q[1]=np.radians(4.01)
+        with self.assertRaisesRegex(RuntimeError,'停稳过程超出'):h.poll_alignment(q,10.06)
+    def test_unsettled_follower_times_out_without_starting_leader(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda _:self.fail('Leader started'))
+        h=Handover(align);held=np.zeros(7);old=held.copy();old[1]=np.radians(3)
+        h.switch(held,None,10,previous_command=old)
+        q=held.copy();q[1]=np.radians(1.1)
+        with self.assertRaisesRegex(RuntimeError,'未稳定停止'):h.poll_alignment(q,13.01)
     def recorder(self,root,source='human',boundary=False):
         r=Recorder(root,'online','token',CFG)
         for i in range(16):

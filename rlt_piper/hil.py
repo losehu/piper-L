@@ -67,28 +67,38 @@ class Handover:
         self.anchor=None;self.follow=None;self.aligner=aligner;self.samples=deque(maxlen=50);self.stable_since=None;self.align_started=False
     def toggle(self):
         with self.lock:self.requested=True
-    def switch(self,measured,leader,now):
+    def switch(self,measured,leader,now,previous_command=None):
         """Freeze the follower first; never sample/move the master on this path."""
         self.generation+=1;self.after=now;self.requested=False
         if self.mode=='human':self.mode='policy';self.anchor=None
         elif self.mode=='aligning':raise RuntimeError('主臂对齐中再次按I，已请求停止；请重新开始本轮')
         else:
             self.follow=np.array(measured,copy=True);self.mode='aligning';self.samples.clear();self.stable_since=None;self.align_started=False
+            previous=self.follow if previous_command is None else np.asarray(previous_command)
+            if previous.shape!=self.follow.shape or not np.isfinite(previous).all():raise RuntimeError('Invalid pre-takeover command')
+            # Until the servo has stopped, residual travel may remain between
+            # measured position and the last command. Never execute that old
+            # command again; use it only to bound the stopping observation.
+            self.stop_lower=np.minimum(self.follow[:6],previous[:6])-np.radians(1)
+            self.stop_upper=np.maximum(self.follow[:6],previous[:6])+np.radians(1)
         return self.mode
     def poll_alignment(self,measured,now):
         if self.aligner is None:raise RuntimeError('Leader auto alignment backend unavailable')
-        if np.max(np.abs(measured[:6]-self.follow[:6]))>np.radians(1):raise RuntimeError('从臂保持姿态偏移，停止主臂对齐')
         if not self.align_started:
+            if np.any(measured[:6]<self.stop_lower) or np.any(measured[:6]>self.stop_upper):raise RuntimeError('从臂停稳过程超出接管前指令范围，未启动主臂对齐')
             self.samples.append((now,np.array(measured,copy=True)))
             recent=[q for t,q in self.samples if now-t<=.22]
             stationary=(self.samples and now-self.samples[0][0]>=.2 and len(recent)>2
                         and np.max(np.ptp(np.array(recent)[:,:6],axis=0))<=np.radians(.1)
+                        and np.max(np.abs(measured[:6]-self.follow[:6]))<=np.radians(.5)
                         and abs(measured[6]-self.follow[6])<=.003)
             self.stable_since=(self.stable_since or now) if stationary else None
             if self.stable_since is not None and now-self.stable_since>=.3:
                 self.aligner.start(self.follow);self.align_started=True
+                print('从臂实测已停稳并保持：开始主臂对齐检查。',flush=True)
             elif now-self.after>3:raise RuntimeError('从臂未稳定停止，未启动主臂对齐')
             return False
+        if np.max(np.abs(measured[:6]-self.follow[:6]))>np.radians(1):raise RuntimeError('从臂保持姿态偏移，停止主臂对齐')
         if self.aligner.error:raise RuntimeError(self.aligner.error)
         if self.aligner.result is None:return False
         q,stamps=self.aligner.result

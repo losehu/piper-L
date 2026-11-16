@@ -51,14 +51,15 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
             with h.lock:
                 if h.requested:
                     if leader is None:raise RuntimeError('Human takeover requires a verified leader reader')
+                    last_command=previous.copy()
                     previous=np.r_[np.clip(measured[:6],settings['policy_command_lower_rad'],settings['policy_command_upper_rad']),np.clip(measured[6],0,.1)]
-                    mode=h.switch(previous,leader,now)
+                    mode=h.switch(previous,leader,now,previous_command=last_command)
                     # Replace all RTC buffers, and cancel the outgoing filter's residual velocity.
                     timeline=Timeline(root,settings,now,initial_action=previous);smoother=CommandSmoother(previous,settings)
                     active_source='hold';started=False
                     guard.running.value=0;guard.startup_deadline.value=now+3
                     recorder.event(mode,h.generation,now)
-                    print('从臂已固定当前位置：等待静止确认，再自动低速对齐主臂，请松开主臂手柄' if mode=='aligning' else '交还策略：保持当前位置，等待新观测和新chunk',flush=True)
+                    print('已清空策略队列并发送当前位置保持：等待从臂实测停稳，再自动低速对齐主臂，请松开主臂手柄' if mode=='aligning' else '交还策略：保持当前位置，等待新观测和新chunk',flush=True)
                 if h.mode=='aligning':
                     target=h.follow;source='hold'
                     if not started:started=True;guard.running.value=1;guard.policy_time.value=now
@@ -87,7 +88,7 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
             previous=command;previous_time=now
             if ui and now>=next_ui:
                 ui.update(phase='aligning' if h.mode=='aligning' else 'running',source='human' if h.mode=='human' else ('hold' if h.mode=='aligning' else active_source),
-                    alignment_phase=h.aligner.phase if h.aligner else None,alignment_progress=h.aligner.progress if h.aligner else 0.,
+                    alignment_phase='follower_stopping' if h.mode=='aligning' and not h.align_started else (h.aligner.phase if h.aligner else None),alignment_progress=h.aligner.progress if h.aligner else 0.,
                     rtt_ms=float(1000*np.median(rtts)) if rtts else None,learner=learner_status,
                     joint_deg=np.degrees(measured[:6]).tolist(),gripper_mm=float(measured[6]*1000))
                 next_ui=now+.1
