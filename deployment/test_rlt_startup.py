@@ -8,6 +8,21 @@ from rlt_piper.ui_bridge import Endpoint
 from rlt_piper.ui_process import Process
 
 class StartupTests(unittest.TestCase):
+    def test_numpy_wire_status_is_json_serialized_over_endpoint(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as folder:
+            guard=SimpleNamespace(stop=SimpleNamespace(value=0));endpoint=Endpoint(Path(folder)/'s',guard)
+            endpoint.update(learner=dict(transitions=np.int64(600),global_step=np.int32(20),ready=np.bool_(True),loss=np.float32(.25)),joint_deg=np.arange(6),generation=np.int64(2))
+            endpoint.start();conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);conn.settimeout(2);conn.connect(str(endpoint.path))
+            try:
+                conn.sendall(b'{"action":"heartbeat"}\n');payload=b''
+                while b'\n' not in payload:
+                    data=conn.recv(8192)
+                    if not data:self.fail('Endpoint closed: '+str(endpoint.error))
+                    payload+=data
+                message=json.loads(payload.split(b'\n',1)[0]);self.assertEqual(message['learner'],dict(transitions=600,global_step=20,ready=True,loss=.25));self.assertEqual(message['joint_deg'],list(range(6)));self.assertEqual(message['generation'],2)
+                self.assertEqual(guard.stop.value,0)
+            finally:endpoint.stop.set();conn.close();endpoint.close()
     def test_large_preview_backpressure_preserves_connection_and_heartbeats(self):
         with tempfile.TemporaryDirectory() as folder:
             guard=SimpleNamespace(stop=SimpleNamespace(value=0));endpoint=Endpoint(Path(folder)/'s',guard)

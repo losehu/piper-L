@@ -2,6 +2,14 @@
 import base64,json,os,socket,stat,threading,time
 from pathlib import Path
 
+def json_default(value):
+    # Msgpack's NumPy codec returns NumPy scalars even for learner counters.
+    # Normalize only at the UI boundary; retain inference/recording types.
+    import numpy as np
+    if isinstance(value,np.ndarray):return value.tolist()
+    if isinstance(value,np.generic):return value.item()
+    raise TypeError('Unsupported UI value: '+type(value).__name__)
+
 class Endpoint:
     def __init__(self,path,guard):
         self.path=Path(path);self.guard=guard;self.lock=threading.Lock();self.stop=threading.Event();self.finishing=threading.Event();self.finish_sent=threading.Event()
@@ -74,7 +82,7 @@ class Endpoint:
                         with self.handover.lock:message.update(mode=self.handover.mode,generation=self.handover.generation,switching=self.handover.requested)
                     if self.recorder:
                         with self.recorder.lock:message.update(recorded_commands=len(self.recorder.commands),accepted_plans=len(self.recorder.plans),outcome=self.recorder.label)
-                    outgoing=(json.dumps(message,separators=(',',':'))+'\n').encode();closing_packet=bool(message.get('closing'));next_status=now+.2
+                    outgoing=(json.dumps(message,separators=(',',':'),default=json_default)+'\n').encode();closing_packet=bool(message.get('closing'));next_status=now+.2
                 if outgoing:
                     # A preview can exceed the socket buffer. Preserve partial
                     # writes and keep reading heartbeats while the UI drains it.
