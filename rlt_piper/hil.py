@@ -38,7 +38,9 @@ class Leader:
     def get(self,ids,max_age=.15):
         if self.error:raise RuntimeError(self.error)
         with self.lock:frames=[self.frames.get(k) for k in ids]
-        if any(f is None or not -.01<=time.monotonic()-f[1]<=max_age for f in frames):raise NotReady('主臂报文缺失/超时')
+        now=time.monotonic()
+        bad=[('0x%03X'%cid)+(' 缺失' if frame is None else ' 超时 %.0fms'%((now-frame[1])*1000)) for cid,frame in zip(ids,frames) if frame is None or not -.01<=now-frame[1]<=max_age]
+        if bad:raise NotReady('主臂报文缺失/超时：'+', '.join(bad))
         return frames
     def vector(self):
         frames=self.get((0x155,0x156,0x157,0x159));q=np.array([v for data,_ in frames[:3] for v in struct.unpack('>ii',data)])*math.pi/180000

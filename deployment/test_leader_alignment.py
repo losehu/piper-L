@@ -50,6 +50,18 @@ class AlignmentTests(unittest.TestCase):
     def test_stop_latch_is_checked_before_every_can_send(self):
         a=Aligner.__new__(Aligner);a.guard=SimpleNamespace(stop=SimpleNamespace(value=1))
         with self.assertRaisesRegex(RuntimeError,'Stop latched'):a.send(0x155,bytes(8))
+    def test_small_measured_boundary_error_does_not_expand_command_range(self):
+        a=Aligner(None,SimpleNamespace(stop=SimpleNamespace(value=0)))
+        q=np.radians([0,-.024,-60,0,30,0]);bounded=a.measured_start(q)
+        self.assertEqual(bounded[1],0);self.assertEqual(a.model.collision(q),'joint limits');self.assertIsNone(a.model.collision(bounded))
+        a.send=lambda *_:self.fail('Invalid target sent')
+        with self.assertRaisesRegex(RuntimeError,'指令超限'):a.joints(q)
+        q[1]=np.radians(-.101)
+        with self.assertRaisesRegex(RuntimeError,'joint limits'):a.measured_start(q)
+    def test_measured_boundary_tolerance_does_not_bypass_tool_collision(self):
+        a=Aligner(None,SimpleNamespace(stop=SimpleNamespace(value=0)))
+        q=np.radians([9.535,-.024,-.184,1.095,30.448,-31.161])
+        with self.assertRaisesRegex(RuntimeError,'base/leader_tool'):a.measured_start(q)
 
 
 class ProtocolSimulationTests(unittest.TestCase):
@@ -60,8 +72,9 @@ class ProtocolSimulationTests(unittest.TestCase):
         clock.sleep=lambda seconds:setattr(clock,'t',clock.t+seconds)
         packets=[];targets=[]
         class Leader:
-            def __init__(self):self.q=np.radians([0,30,-60,0,30,0]);self.error=None;self.role=0xFA;self.query=1;self.bus=self
+            def __init__(self):self.q=np.radians([0,30,-60,0,30,0]);self.error=None;self.role=0xFA;self.query=1;self.bus=self;self.native=False
             def vector(self):
+                if not self.native:raise RuntimeError('Native teaching commands silent until drag restored')
                 if self.role!=0xFA:raise RuntimeError('Native frames unavailable in controlled mode')
                 return np.r_[self.q,.04],np.full(4,clock.t+.0001)
             def feedback(self):return np.r_[self.q,0.],np.full(3,clock.t+.0001)
@@ -82,6 +95,7 @@ class ProtocolSimulationTests(unittest.TestCase):
             def send(self,message,timeout):
                 cid,data=message.arbitration_id,message.data;packets.append((cid,data))
                 if cid==0x470:self.role=data[0]
+                elif cid==0x191:self.native=True
                 elif cid==0x472:self.query=data[0]
                 elif cid in (0x155,0x156,0x157):
                     i=(cid-0x155)*2;self.q[i:i+2]=np.radians(np.array(struct.unpack('>ii',data))/1000)

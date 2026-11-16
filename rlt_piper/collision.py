@@ -54,10 +54,10 @@ class Model:
         pose=frames[-1];lo,hi=np.array(self.tool['min']),np.array(self.tool['max'])
         boxes.append((pose[:3,:3]@((lo+hi)/2)+pose[:3,3],pose[:3,:3],(hi-lo)/2))
         return boxes
-    def collision(self,q,extra=0.):
+    def collision(self,q,extra=0.,limit_tolerance=0.):
         if self.cancelled():raise RuntimeError('Leader path check cancelled by stop')
         q=np.asarray(q)
-        if q.shape!=(6,) or not np.isfinite(q).all() or np.any(q<self.lower) or np.any(q>self.upper):return 'joint limits'
+        if q.shape!=(6,) or not np.isfinite(q).all() or np.any(q<self.lower-limit_tolerance) or np.any(q>self.upper+limit_tolerance):return 'joint limits'
         boxes=self.geometry(q)
         for i,a in enumerate(boxes):
             # Fixed base is mounted on the table; moving geometry must stay above it.
@@ -66,15 +66,15 @@ class Model:
                 if j==i+1 or (i,j) in self.exclusions:continue
                 if overlap(a,boxes[j],self.margin+extra):return '%s/%s'%(self.spec['names'][i],self.spec['names'][j])
         return None
-    def edge(self,a,b):
+    def edge(self,a,b,limit_tolerance=0.):
         a,b=np.asarray(a),np.asarray(b)
-        if self.collision(a) or self.collision(b):return False
+        if self.collision(a,limit_tolerance=limit_tolerance) or self.collision(b,limit_tolerance=limit_tolerance):return False
         def segment(left,right,depth):
             sweep=self.reach*float(np.sum(np.abs(right-left)))
-            if self.collision(left,sweep) is None and self.collision(right,sweep) is None:return True
+            if self.collision(left,sweep,limit_tolerance) is None and self.collision(right,sweep,limit_tolerance) is None:return True
             if depth>=18:return False
             middle=(left+right)/2
-            if self.collision(middle):return False
+            if self.collision(middle,limit_tolerance=limit_tolerance):return False
             return segment(left,middle,depth+1) and segment(middle,right,depth+1)
         return segment(a,b,0)
     def plan(self,start,goal,budget_s=4.):

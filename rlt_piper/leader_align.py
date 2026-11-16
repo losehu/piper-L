@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from rlt_piper.collision import Model
 from rtc_piper.observations import NotReady
+MEASURED_LIMIT_TOLERANCE=np.radians(.1)
 
 def software_version(raw):
     # Official pyAgxArm get_firmware: eleven 8-byte frames; software is
@@ -60,6 +61,7 @@ class Aligner:
         self.model.lower=np.maximum(self.model.lower,low);self.model.upper=np.minimum(self.model.upper,high)
         if np.any(self.model.lower>=self.model.upper):raise RuntimeError('Invalid live leader joint limits')
     def joints(self,q):
+        if self.model.collision(q):raise RuntimeError('主臂指令超限或碰撞，拒绝发送')
         values=np.rint(np.degrees(q)*1000).astype(np.int32)
         for i in range(3):self.send(0x155+i,struct.pack('>ii',int(values[2*i]),int(values[2*i+1])))
     def mode(self):self.send(0x151,[1,1,5,0,0,0,0,0])
@@ -68,18 +70,27 @@ class Aligner:
         self.leader.status()
         if after is not None and np.min(stamps)<=after:raise NotReady('Waiting for post-mode leader feedback')
         return q,stamps
+    def measured_start(self,q):
+        reason=self.model.collision(q,limit_tolerance=MEASURED_LIMIT_TOLERANCE)
+        if reason:raise RuntimeError('主臂当前姿态未通过限位/防自碰撞检查（'+reason+'）；保持从臂停止，请先手动展开主臂再重新接管')
+        bounded=np.clip(q,self.model.lower,self.model.upper)
+        if not self.model.edge(q,bounded,limit_tolerance=MEASURED_LIMIT_TOLERANCE):raise RuntimeError('Leader measured-to-bounded start sweep is not collision-free')
+        return bounded
     def run(self):
         try:
             self.firmware();self.limits();goal=self.target[:6]
             self.phase='countdown';self.pause(2.)
             for _ in range(3):
-                start,_=self.leader.vector();self.phase='planning';path=self.model.plan(start[:6],goal)
-                fresh,_=self.leader.vector()
+                # Native teaching commands may be silent at rest. Positioning
+                # starts from measured joints, not cached teaching commands.
+                start,_=self.leader.feedback();self.phase='planning';path=self.model.plan(self.measured_start(start[:6]),goal)
+                fresh,_=self.leader.feedback()
                 if np.max(np.abs(fresh[:6]-start[:6]))<=np.radians(.2):break
             else:raise RuntimeError('主臂在规划时持续移动，拒绝自动对齐')
             # Check the last refreshed start to the planned start as well.
-            if not self.model.edge(fresh[:6],path[0]):raise RuntimeError('Leader initial sweep is not collision-free')
-            if np.max(np.abs(fresh[:6]-path[0]))>1e-9:path=[fresh[:6].copy()]+path
+            bounded_fresh=self.measured_start(fresh[:6])
+            if not self.model.edge(fresh[:6],path[0],limit_tolerance=MEASURED_LIMIT_TOLERANCE):raise RuntimeError('Leader initial sweep is not collision-free')
+            if np.max(np.abs(bounded_fresh-path[0]))>1e-9:path=[bounded_fresh]+path
             self.phase='mode_switch'
             self.guard.leader_active.value=1
             switched=time.monotonic();self.send(0x470,[0xFC,0,0,0,0,0,0,0]);self.mode();self.joints(path[0])
@@ -98,7 +109,7 @@ class Aligner:
                 while True:
                     now=time.monotonic();s=min(1.,(now-began)/duration);blend=10*s**3-15*s**4+6*s**5;command=a+(b-a)*blend
                     measured,_=self.ordinary()
-                    if self.model.collision(measured[:6]) or not self.model.edge(measured[:6],command):raise RuntimeError('主臂实测/指令扫掠接近碰撞，停止')
+                    if self.model.collision(measured[:6],limit_tolerance=MEASURED_LIMIT_TOLERANCE) or not self.model.edge(measured[:6],command,limit_tolerance=MEASURED_LIMIT_TOLERANCE):raise RuntimeError('主臂实测/指令扫掠接近碰撞，停止')
                     if np.max(np.abs(measured[:6]-previous))>np.radians(2):raise RuntimeError('主臂跟踪误差过大，停止')
                     self.mode();self.joints(command);previous=command;self.progress=(i+s)/total
                     if s>=1:break
@@ -106,7 +117,7 @@ class Aligner:
             self.phase='settling';stable=None;until=time.monotonic()+5
             while time.monotonic()<until:
                 measured,_=self.ordinary()
-                if self.model.collision(measured[:6]) or not self.model.edge(measured[:6],goal):raise RuntimeError('主臂到位保持的扫掠检查失败')
+                if self.model.collision(measured[:6],limit_tolerance=MEASURED_LIMIT_TOLERANCE) or not self.model.edge(measured[:6],goal,limit_tolerance=MEASURED_LIMIT_TOLERANCE):raise RuntimeError('主臂到位保持的扫掠检查失败')
                 self.mode();self.joints(goal)
                 if np.max(np.abs(measured[:6]-goal))<=np.radians(.5):
                     stable=stable or time.monotonic()
