@@ -1,5 +1,5 @@
 """Native desktop console for Piper human-in-the-loop RLT. Opens idle."""
-import argparse,fcntl,os,time
+import argparse,fcntl,os,time,subprocess,shlex
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
@@ -37,7 +37,9 @@ class App:
         self.success=self.button(row,'成功  S','#25774c',lambda:self.action('success'));self.success.pack(side='left',expand=True,fill='x',padx=(0,4))
         self.failure=self.button(row,'失败  F','#a15a16',lambda:self.action('failure'));self.failure.pack(side='left',expand=True,fill='x',padx=(4,0))
         self.stop_button=self.button(controls,'■  阻尼急停',RED,self.emergency);self.stop_button.pack(fill='x',pady=(12,6))
-        self.check_button=tk.Button(controls,text='只检查模型 · 不动臂',command=lambda:self.start(check=True),bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.check_button.pack(fill='x',pady=(0,9))
+        tools=tk.Frame(controls,bg='white');tools.pack(fill='x',pady=(0,9))
+        self.check_button=tk.Button(tools,text='模型检查·不动臂',command=lambda:self.start(check=True),bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.check_button.pack(side='left',fill='x',expand=True,padx=(0,4))
+        self.can_button=tk.Button(tools,text='恢复CAN',command=self.restore_can,bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.can_button.pack(side='left',fill='x',expand=True)
         tk.Label(controls,text='启动会自动准备、对齐并执行。\n接管将自动移动主臂，请松手让开。',justify='left',wraplength=240,bg='white',fg=MUTED,font=('Noto Sans CJK SC',9)).pack(anchor='w')
         cameras=tk.Frame(body,bg=BG);cameras.pack(side='left',expand=True,fill='both')
         self.camera_labels={}
@@ -57,7 +59,7 @@ class App:
         # Widget bindings precede Tk Button's class binding: Space must never
         # activate a focused Success/Start button before the global stop sees it.
         for widget in [window,self.start_button,self.takeover_button,self.success,self.failure,self.stop_button,
-                       self.check_button,self.learnbox,self.combo,self.log]:
+                       self.check_button,self.can_button,self.learnbox,self.combo,self.log]:
             for key in ('<KeyPress-space>','<KeyRelease-space>','<Escape>','<Control-c>'):widget.bind(key,stop_key)
         self.append('界面已就绪，机械臂未启动。\n'+('演示模式：所有按钮仅操作模拟状态。\n' if demo else ''))
         self.tick()
@@ -76,6 +78,14 @@ class App:
             for label in self.camera_labels.values():label.configure(image='',text='等待实时画面\n启动本轮后显示')
             self.engine.start(stage,learn=self.learning.get() and stage!='eval',check=check)
         except Exception as e:self.append('启动失败：%s\n'%e)
+    def restore_can(self):
+        if self.engine.active:return
+        if self.demo:self.append('演示模式不会修改CAN接口。\n');return
+        command="sudo "+shlex.quote(str(self.root/'restore_rlt_can.sh'))+"; task_result=$?; echo; echo 退出码：$task_result; read -r -p '按回车关闭窗口'"
+        try:
+            subprocess.Popen(['/usr/bin/gnome-terminal','--title=恢复CAN网络接口（需管理员认证）','--','bash','-c',command])
+            self.append('已打开系统终端：输入sudo密码恢复CAN网络，完成后再点启动本轮。此步骤不使能或移动机械臂。\n')
+        except OSError as e:self.append('无法打开恢复终端：%s\n'%e)
     def action(self,action):
         try:self.engine.send(action)
         except Exception as e:self.append('操作未执行：%s\n'%e)
@@ -92,6 +102,7 @@ class App:
         for key,value in values.items():self.metrics[key].configure(text=value)
         enabled=active and phase=='running' and state.get('ready') and not state.get('stopped')
         self.start_button.configure(state='disabled' if active or self.closing else 'normal');self.check_button.configure(state='disabled' if active or self.closing else 'normal')
+        self.can_button.configure(state='disabled' if active or self.closing else 'normal')
         self.combo.configure(state='disabled' if active else 'readonly');self.learnbox.configure(state='disabled' if active else 'normal')
         self.takeover_button.configure(text='主臂自动对齐中' if mode=='aligning' else ('交还策略  I' if mode=='human' else '人工接管  I'),command=lambda:self.action('resume' if self.engine.state.get('mode')=='human' else 'takeover'),state='normal' if enabled and not state.get('switching') else 'disabled')
         for button in [self.success,self.failure]:button.configure(state='normal' if enabled else 'disabled')

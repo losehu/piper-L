@@ -22,6 +22,18 @@ class Service:
         if actions.shape!=(50,7) or not np.isfinite(actions).all():raise RuntimeError('Invalid RLT output')
         return dict(response,actions=actions,rlt=self.policy.last,observed_at=request['observed_at'])
 
+async def graceful_server(server):
+    import asyncio
+    from websockets.asyncio.server import serve
+    from openpi.serving.websocket_policy_server import _health_check
+    loop=asyncio.get_running_loop();stopped=asyncio.Event()
+    for sig in (signal.SIGTERM,signal.SIGINT):loop.add_signal_handler(sig,stopped.set)
+    try:
+        async with serve(server._handler,server._host,server._port,compression=None,max_size=None,process_request=_health_check):
+            await stopped.wait()
+    finally:
+        for sig in (signal.SIGTERM,signal.SIGINT):loop.remove_signal_handler(sig)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--assets',type=Path,required=True)
     p.add_argument('--stage',choices=['collect','eval','online'],required=True);p.add_argument('--learn',action='store_true');args=p.parse_args()
@@ -47,8 +59,6 @@ def main():
     from rlt_piper.live import PriorityGate,Learner
     gate=PriorityGate();learner=Learner(root,directory,policy,gate) if args.learn and args.stage!='eval' else None
     if learner:learner.start()
-    def shutdown(*_):raise SystemExit(0)
-    signal.signal(signal.SIGTERM,shutdown)
     metadata=dict(protocol=SCHEMA,model='pi05_piper_rlt',base_step=2500,base_frozen=True,rlt_stage=args.stage,
                   rlt_actor_version=policy.version,rlt_chunk_len=18,rlt_token_sha256=m['token_sha256'],
                   action_horizon=50,physical_action_dim=7,fps=30,warmed_up=True,corrector_enabled=False,
@@ -57,7 +67,9 @@ def main():
                owner_root=str(root),status='ready',port=8003,metadata=metadata,hardware_opened=False)
     (root/'logs/rlt_service.json').write_text(json.dumps(state,indent=2)+'\n')
     from openpi.serving.websocket_policy_server import WebsocketPolicyServer
-    try:WebsocketPolicyServer(Service(policy,gate,learner),host='127.0.0.1',port=8003,metadata=metadata).serve_forever()
+    import asyncio
+    server=WebsocketPolicyServer(Service(policy,gate,learner),host='127.0.0.1',port=8003,metadata=metadata)
+    try:asyncio.run(graceful_server(server))
     finally:
         if learner:learner.close()
 

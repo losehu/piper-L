@@ -86,16 +86,18 @@ def execute(directory,stage,settings,learn,leader_config):
     from rlt_piper.recording import Recorder
     from rlt_piper.labels import Labels
     guard=Guard(settings['channel'],policy_timeout_s=.8);process=policy=arm=cameras=labels=recorder=lock=None
-    terminal=None;error=None;leader=None;ui=None;aligner=None
+    terminal=None;error=None;leader=None;ui=None;aligner=None;closing=False
     def signal_stop(*_):
         guard.stop.value=1
-        if not guard.armed.value:raise KeyboardInterrupt
+        if not guard.armed.value and not closing:raise KeyboardInterrupt
     old={sig:signal.signal(sig,signal_stop) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
     try:
         candidate=follower_lock(settings);candidate.__enter__();lock=candidate
         from rlt_piper.ui_bridge import Endpoint
         ui=Endpoint.from_environment(guard)
         if ui:ui.start()
+        from rlt_piper.preflight import check_can
+        check_can(settings,leader_config)
         guard.start();process=start(directory,stage,guard,learn=learn);policy=Client(stage)
         if stage=='online' and not policy.metadata['rlt_actor_version']:
             print('BASE WARMUP：当前由冻结π0.5控制；回放和BC预热完成后才在新chunk启用actor。',flush=True)
@@ -129,9 +131,13 @@ def execute(directory,stage,settings,learn,leader_config):
                         finally:terminal_client.close()
                         terminal=dict(t=obs.t,**{k:result['rlt'][k] for k in ['z_rl','proprio','ref_chunk']})
                     except Exception as e:error=str(e)
+    except BaseException as exc:
+        if error is None:error=repr(exc)
+        raise
     finally:
+        closing=True
+        if ui:ui.update(closing=True,ready=False,phase='error' if error else 'stopping',notice=error or '')
         try:
-            if ui:ui.close()
             guard.close()
         finally:
             try:
@@ -145,8 +151,11 @@ def execute(directory,stage,settings,learn,leader_config):
             finally:
                 try:stop(process)
                 finally:
-                    if lock:lock.__exit__(None,None,None)
-                    for sig,handler in old.items():signal.signal(sig,handler)
+                    try:
+                        if ui:ui.close()
+                    finally:
+                        if lock:lock.__exit__(None,None,None)
+                        for sig,handler in old.items():signal.signal(sig,handler)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('command',choices=['check','run','train'],default='check',nargs='?')

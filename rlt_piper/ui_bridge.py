@@ -4,7 +4,7 @@ from pathlib import Path
 
 class Endpoint:
     def __init__(self,path,guard):
-        self.path=Path(path);self.guard=guard;self.lock=threading.Lock();self.stop=threading.Event()
+        self.path=Path(path);self.guard=guard;self.lock=threading.Lock();self.stop=threading.Event();self.finishing=threading.Event();self.finish_sent=threading.Event()
         self.data=dict(phase='loading',mode='policy',source='hold',learner={},ready=False)
         self.recorder=self.handover=self.bank=None;self.error=None
     @classmethod
@@ -67,19 +67,22 @@ class Endpoint:
                 except socket.timeout:pass
                 now=time.monotonic()
                 if now-last>1:raise RuntimeError('UI heartbeat expired')
-                if now>=next_status:
-                    if now>=next_preview:preview=self.preview();next_preview=now+1
+                if now>=next_status or self.finishing.is_set():
+                    if now>=next_preview and not self.finishing.is_set():preview=self.preview();next_preview=now+1
                     with self.lock:message=dict(self.data,**preview,t=now,stopped=bool(self.guard.stop.value))
                     if self.handover:
                         with self.handover.lock:message.update(mode=self.handover.mode,generation=self.handover.generation,switching=self.handover.requested)
                     if self.recorder:
                         with self.recorder.lock:message.update(recorded_commands=len(self.recorder.commands),accepted_plans=len(self.recorder.plans),outcome=self.recorder.label)
                     conn.sendall((json.dumps(message,separators=(',',':'))+'\n').encode());next_status=now+.2
+                    if self.finishing.is_set():self.finish_sent.set();break
         except BaseException as e:
             if not self.stop.is_set():self.error=repr(e);self.guard.stop.value=1
         finally:
             if conn:conn.close()
     def close(self):
+        self.update(closing=True,ready=False);self.finishing.set()
+        if hasattr(self,'thread') and self.thread.is_alive():self.finish_sent.wait(.3)
         self.stop.set()
         if hasattr(self,'thread'):self.thread.join(2)
         if hasattr(self,'server'):self.server.close()
