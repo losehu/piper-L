@@ -61,7 +61,7 @@ def main():
     try:run(a.root,Arm(),SimpleNamespace(check=lambda:None),Bank(),Guard(),policy,state.copy(),epoch-.2,cfg,rec,h,Leader())
     except Finished:pass
     finally:thread.join()
-    if len(rec.events)!=6 or not any(c[2]==2 for c in rec.commands):raise RuntimeError('Handover was not exercised')
+    if len(rec.events)!=7 or not any(c[2]==2 for c in rec.commands):raise RuntimeError('Handover was not exercised')
     if not all(p['t']>next(e['t'] for e in rec.events if e['generation']==p['generation']) for p in rec.plans if p['generation']):raise RuntimeError('Stale chunk accepted')
     # At least one in-flight request crossed each handover; none may be accepted afterwards.
     for p in rec.plans:

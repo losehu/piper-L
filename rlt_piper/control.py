@@ -14,6 +14,7 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
         except NotReady:time.sleep(1/120);continue
         if first.t>after and np.all(first.state_times>after):break
         time.sleep(1/120)
+    recorder.event('policy',h.generation,first.t)
     timeline=Timeline(root,settings,first.t,initial_action=previous);smoother=CommandSmoother(previous,settings)
     stop=threading.Event();errors=[];rtts=deque(maxlen=100);active_source='hold';learner_status={}
     def infer():
@@ -78,7 +79,7 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
                 if started:arm.grip(command[6],settings['gripper_force_n'])
                 # SDK uses millidegree joint integers and micrometre gripper integers.
                 actual=np.r_[np.rint(np.degrees(command[:6])*1000)*np.pi/180000,np.rint(command[6]*1e6)/1e6]
-                recorder.command(time.monotonic(),actual,source,h.generation,raw_leader,leader_times)
+                recorder.command(time.monotonic(),actual,source,h.generation,raw_leader,leader_times,measured,stamps)
                 if h.mode=='aligning' and h.poll_alignment(measured,time.monotonic()):
                     recorder.event('human',h.generation,h.after)
                     timeline=Timeline(root,settings,h.after,initial_action=command);smoother=CommandSmoother(command,settings)

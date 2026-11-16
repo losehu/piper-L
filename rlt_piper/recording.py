@@ -3,6 +3,7 @@ import json,threading,time,uuid
 from pathlib import Path
 import numpy as np
 from rlt_piper.contract import SCHEMA,CHUNK
+from rlt_piper.trimming import keep_commands,VERSION as TRIM_VERSION
 
 REPLAY='piper-rlt-hil-v2'
 SOURCES={'base':0,'rlt':1,'human':2,'corrector':4,'hold':5}
@@ -24,10 +25,12 @@ class Recorder:
         row['state_times']=np.array(getattr(obs,'state_times',np.full(4,np.nan)),copy=True)
         row.update({k:np.array(item[k],copy=True) for k in ['z_rl','proprio','ref_chunk','proposed_chunk']})
         with self.lock:self.plans.append(row)
-    def command(self,stamp,command,source=None,generation=0,leader=None,leader_times=None):
+    def command(self,stamp,command,source=None,generation=0,leader=None,leader_times=None,measured=None,state_times=None):
         row=(float(stamp),np.array(command,copy=True),-1 if source is None else SOURCES[source],int(generation),
              np.full(7,np.nan) if leader is None else np.array(leader,copy=True),
-             np.full(4,np.nan) if leader_times is None else np.array(leader_times,copy=True))
+             np.full(4,np.nan) if leader_times is None else np.array(leader_times,copy=True),
+             np.full(7,np.nan) if measured is None else np.array(measured,copy=True),
+             np.full(4,np.nan) if state_times is None else np.array(state_times,copy=True))
         with self.lock:self.commands.append(row)
     def event(self,mode,generation,stamp):
         with self.lock:self.events.append(dict(mode=mode,generation=generation,t=stamp))
@@ -53,7 +56,9 @@ class Recorder:
                 values={k:np.array([p[k] for p in plans]) for k in plans[0]}
                 values.update(command_t=np.array([c[0] for c in commands]),commands=np.stack([c[1] for c in commands]),
                               command_source=np.array([c[2] for c in commands]),command_generation=np.array([c[3] for c in commands]),
-                              leader=np.stack([c[4] for c in commands]),leader_times=np.stack([c[5] for c in commands]))
+                              leader=np.stack([c[4] for c in commands]),leader_times=np.stack([c[5] for c in commands]),command_state=np.stack([c[6] for c in commands]),
+                              command_state_times=np.stack([c[7] for c in commands]))
+                _,meta['training_trim']=keep_commands(values,meta)
                 if terminal:values.update(terminal_t=np.array(terminal['t']),**{'terminal_'+k:np.asarray(terminal[k]) for k in ['z_rl','proprio','ref_chunk']})
                 np.savez_compressed(self.directory/name,**values)
             else:meta['trace']=None
@@ -85,13 +90,18 @@ def transitions(path,token_sha):
         except FileNotFoundError:continue
     else:return []
     times=d['t'];cmd_t=d['command_t'];result=[]
+    keep,trim=keep_commands(d,m)
+    ranges={r['generation']:r for r in trim['ranges']}
     terminal=bool(m.get('labelled') and m.get('terminal_available') and not m.get('error'))
     end=min(float(m['label_at']),float(d['terminal_t'])) if terminal else cmd_t[-1]
     for i,t in enumerate(times):
+        interval=ranges.get(int(d['generation'][i]))
+        if interval and (interval['start'] is None or not interval['start']-1e-9<=t<=interval['end']+1e-9):continue
         valid=min(CHUNK,int(np.ceil((end-t)*30-1e-7)))
         if valid<1 or (not terminal and valid<CHUNK):continue
         grid=t+np.arange(valid)/30;indices=np.searchsorted(cmd_t,grid,side='right')-1
         if np.any(indices<0) or np.any(grid-cmd_t[indices]>.1):continue
+        if not np.all(keep[indices]):continue
         source=d['command_source'][indices];generation=d['command_generation'][indices]
         # Compatibility for software replays created without explicit TX ownership.
         if np.all(source==-1):
@@ -103,6 +113,9 @@ def transitions(path,token_sha):
         j=np.searchsorted(times,t+CHUNK/30)
         if not done:
             if j>=len(times) or times[j]-(t+CHUNK/30)>.15 or d['generation'][j]!=d['generation'][i]:continue
+            if interval and times[j]>interval['end']+1e-9:continue
+            next_command=np.searchsorted(cmd_t,times[j],side='right')-1
+            if next_command<0 or not keep[next_command]:continue
             following={k:d[k][j] for k in ['z_rl','proprio','ref_chunk']}
         else:following={k:d['terminal_'+k] for k in ['z_rl','proprio','ref_chunk']}
         # Unlabelled policy experience can bootstrap while live. After an abort,
