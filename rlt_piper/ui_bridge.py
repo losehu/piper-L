@@ -31,6 +31,7 @@ class Endpoint:
             self.recorder.outcome(int(action=='success'),self.guard);return
         h=self.handover
         with h.lock:
+            if h.mode=='aligning':raise ValueError('主臂正在自动对齐，从臂保持；取消请按阻尼急停')
             if h.requested:raise ValueError('正在切换控制权，请等待')
             if item.get('generation')!=h.generation:raise ValueError('界面状态已更新，请重试')
             if (action=='takeover')!=(h.mode=='policy'):raise ValueError('控制模式已改变')

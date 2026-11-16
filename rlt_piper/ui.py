@@ -7,7 +7,7 @@ from tkinter.scrolledtext import ScrolledText
 from rlt_piper.ui_process import Process,Demo
 
 BG='#eef2f6';INK='#172b43';MUTED='#67788c';TEAL='#087e76';BLUE='#315ed2';RED='#b42336'
-PHASE={'idle':'待机','loading':'加载模型','checking':'离线检查','preparing':'机械臂准备 / 自动对齐','running':'执行中','stopping':'阻尼停止中','stopped':'已停止','finished':'本轮结束','error':'启动失败 / 运行异常'}
+PHASE={'idle':'待机','loading':'加载模型','checking':'离线检查','preparing':'机械臂准备 / 自动对齐','running':'执行中','aligning':'主臂对齐 / 从臂保持','stopping':'阻尼停止中','stopped':'已停止','finished':'本轮结束','error':'启动失败 / 运行异常'}
 
 class App:
     def __init__(self,window,root,demo=False,engine=None):
@@ -38,7 +38,7 @@ class App:
         self.failure=self.button(row,'失败  F','#a15a16',lambda:self.action('failure'));self.failure.pack(side='left',expand=True,fill='x',padx=(4,0))
         self.stop_button=self.button(controls,'■  阻尼急停',RED,self.emergency);self.stop_button.pack(fill='x',pady=(12,6))
         self.check_button=tk.Button(controls,text='只检查模型 · 不动臂',command=lambda:self.start(check=True),bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.check_button.pack(fill='x',pady=(0,9))
-        tk.Label(controls,text='启动会自动准备、对齐并执行。\n接管前主臂须已处于拖动模式。',justify='left',wraplength=240,bg='white',fg=MUTED,font=('Noto Sans CJK SC',9)).pack(anchor='w')
+        tk.Label(controls,text='启动会自动准备、对齐并执行。\n接管将自动移动主臂，请松手让开。',justify='left',wraplength=240,bg='white',fg=MUTED,font=('Noto Sans CJK SC',9)).pack(anchor='w')
         cameras=tk.Frame(body,bg=BG);cameras.pack(side='left',expand=True,fill='both')
         self.camera_labels={}
         for key,title in [('cam0','CAM 01 · 场景相机'),('cam1','CAM 02 · 手腕相机')]:
@@ -86,19 +86,20 @@ class App:
         state=self.engine.poll();self.append(self.engine.take_logs());phase=state.get('phase','idle');active=self.engine.active
         self.badge.configure(text='● '+PHASE.get(phase,phase),bg=RED if phase in ('error','stopping') else ('#0a756f' if phase=='running' else '#2b4259'))
         learner=state.get('learner',{});mode=state.get('mode');source=state.get('source')
-        values=dict(source='人工接管' if mode=='human' else {'base':'π0.5','rlt':'RLT Actor','hold':'保持'}.get(source,'待机'),
+        values=dict(source='从臂保持' if mode=='aligning' else ('人工接管' if mode=='human' else {'base':'π0.5','rlt':'RLT Actor','hold':'保持'}.get(source,'待机')),
             rtt=('%.0f ms'%state['rtt_ms']) if state.get('rtt_ms') is not None else '—',replay=str(learner.get('transitions','—')),
             human=str(learner.get('human_transitions','—')),step=str(learner.get('global_step','—')),actor=str(learner.get('actor_version','—')))
         for key,value in values.items():self.metrics[key].configure(text=value)
         enabled=active and phase=='running' and state.get('ready') and not state.get('stopped')
         self.start_button.configure(state='disabled' if active or self.closing else 'normal');self.check_button.configure(state='disabled' if active or self.closing else 'normal')
         self.combo.configure(state='disabled' if active else 'readonly');self.learnbox.configure(state='disabled' if active else 'normal')
-        self.takeover_button.configure(text='交还策略  I' if mode=='human' else '人工接管  I',command=lambda:self.action('resume' if self.engine.state.get('mode')=='human' else 'takeover'),state='normal' if enabled and not state.get('switching') else 'disabled')
+        self.takeover_button.configure(text='主臂自动对齐中' if mode=='aligning' else ('交还策略  I' if mode=='human' else '人工接管  I'),command=lambda:self.action('resume' if self.engine.state.get('mode')=='human' else 'takeover'),state='normal' if enabled and not state.get('switching') else 'disabled')
         for button in [self.success,self.failure]:button.configure(state='normal' if enabled else 'disabled')
         self.stop_button.configure(state='normal' if active else 'disabled')
         if 'joint_deg' in state:self.detail.configure(text='关节角度 °   '+ '   '.join('%6.1f'%v for v in state['joint_deg'])+'     夹爪 %.1f mm'%state.get('gripper_mm',0))
         elif phase=='idle':self.detail.configure(text='机械臂未启动 · Corrector 关闭')
         training={'waiting_for_replay':'等待有效回放','training':'后台训练中','learning_paused':'训练已暂停','off':'后台训练关闭'}.get(learner.get('status'),'等待训练状态')
+        if mode=='aligning' and active:training='从臂保持中 · 主臂对齐 '+{'checking':'核对固件 / 限位','countdown':'即将移动，请松手','planning':'检查整条路径','mode_switch':'切换定位模式','moving':'低速对齐','settling':'确认稳定','restoring_drag':'恢复拖动'}.get(state.get('alignment_phase'),str(state.get('alignment_phase','')))+' %.0f%%'%(100*state.get('alignment_progress',0))
         if active:self.training.configure(text=training+(' · BC 预热，当前由 π0.5 控制' if not learner.get('ready') and source=='base' else '')+(' · '+learner['error'] if learner.get('error') else ''),fg=RED if learner.get('error') else TEAL)
         elif state.get('outcome') is not None:self.training.configure(text='本轮已标记：'+('成功' if state['outcome']==1 else '失败')+'。重开下一轮即可继续采集和学习。')
         elif phase in ('stopped','error','finished'):self.training.configure(text=PHASE[phase]+'，请查看日志。')

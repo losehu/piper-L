@@ -12,17 +12,34 @@ from rlt_piper.serve import Service
 
 CFG=dict(fps=30,control_hz=120,execute_horizon=18,chunk_smoothing_steps=12,command_filter_tau_s=.05)
 class HilTests(unittest.TestCase):
-    def test_relative_handover_zero_jump_and_stale_result_rejected(self):
-        h=Handover();q=np.arange(7)*.1;leader=SimpleNamespace(vector=lambda:(q,np.ones(4)*10))
-        previous=np.ones(7)*.02;h.toggle()
-        self.assertFalse(h.accepts(0,11))
+    def test_follower_freezes_before_leader_alignment_and_stale_results_rejected(self):
+        class Align:
+            error=None;result=None
+            def start(self,target):self.target=np.array(target,copy=True)
+        align=Align();h=Handover(align);q=np.arange(7)*.1
+        leader=SimpleNamespace(vector=lambda:(q.copy(),np.ones(4)*10))
+        previous=np.ones(7)*.02;h.toggle();self.assertFalse(h.accepts(0,11))
         with h.lock:h.switch(previous,leader,10)
+        self.assertEqual(h.mode,'aligning');np.testing.assert_allclose(h.follow,previous)
+        self.assertFalse(hasattr(align,'target'))
+        for now in np.arange(10.01,10.8,.01):h.poll_alignment(previous,now)
+        np.testing.assert_allclose(align.target,previous)
+        q=previous.copy();q[6]=.08;align.result=(q.copy(),np.ones(4)*11)
+        self.assertTrue(h.poll_alignment(previous,11));self.assertEqual(h.mode,'human')
         np.testing.assert_allclose(h.target(leader)[0],previous)
-        q[:6]+=.1
-        np.testing.assert_allclose(h.target(leader)[0][:6],previous[:6]+.1)
-        self.assertFalse(h.accepts(0,11));self.assertFalse(h.accepts(1,9.9));self.assertTrue(h.accepts(1,10.1))
+        q[0]+=.1;q[6]+=.005
+        self.assertAlmostEqual(h.target(leader)[0][0],previous[0]+.1)
+        self.assertAlmostEqual(h.target(leader)[0][6],previous[6]+.005)
+        self.assertFalse(h.accepts(1,11.1));self.assertTrue(h.accepts(2,11.1))
         h.toggle();h.switch(previous,leader,12)
-        self.assertEqual(h.mode,'policy');self.assertFalse(h.accepts(1,12.1));self.assertTrue(h.accepts(2,12.1))
+        self.assertEqual(h.mode,'policy');self.assertFalse(h.accepts(2,12.1));self.assertTrue(h.accepts(3,12.1))
+    def test_leader_does_not_start_until_follower_stops(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda _:self.fail('Moving follower must not start leader'))
+        h=Handover(align);h.switch(np.zeros(7),None,10)
+        for i in range(200):
+            now=10+i*.01;state=np.zeros(7);state[0]=np.radians(.3)*np.sin(i*.5)
+            h.poll_alignment(state,now)
+        self.assertFalse(h.align_started)
     def recorder(self,root,source='human',boundary=False):
         r=Recorder(root,'online','token',CFG)
         for i in range(16):

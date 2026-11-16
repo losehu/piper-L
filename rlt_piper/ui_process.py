@@ -95,11 +95,14 @@ class Demo:
         self.active=True;self.started=time.monotonic();self.state.update(phase='running',mode='policy',source='base',ready=True,stage=stage,generation=0,outcome=None)
         self.lines.append('演示模式：所有状态均为模拟，不打开硬件，不执行推理或训练。\n')
     def send(self,action):
-        if action=='takeover':self.state.update(mode='human',source='human',generation=self.state.get('generation',0)+1)
-        elif action=='resume':self.state.update(mode='policy',source='rlt',generation=self.state.get('generation',0)+1)
+        if action=='takeover':
+            self.align_until=time.monotonic()+.6;self.state.update(phase='aligning',mode='aligning',source='hold',alignment_phase='moving',alignment_progress=.5,generation=self.state.get('generation',0)+1)
+        elif action=='resume':self.state.update(phase='running',mode='policy',source='rlt',generation=self.state.get('generation',0)+1)
         elif action in ('success','failure'):self.active=False;self.state.update(phase='finished',ready=False,outcome=int(action=='success'))
     def stop(self):self.active=False;self.state.update(phase='stopped',ready=False)
     def poll(self):
+        if self.active and self.state.get('mode')=='aligning' and time.monotonic()>=self.align_until:
+            self.state.update(phase='running',mode='human',source='human',generation=self.state.get('generation',0)+1)
         if self.active:self.state.update(rtt_ms=144.2,recorded_commands=int((time.monotonic()-self.started)*120),learner=dict(status='training',global_step=1240,transitions=768,human_transitions=156,actor_version=0,ready=False),joint_deg=[-3.9,.2,.2,7.5,13.8,-16.8],gripper_mm=35.)
         return self.state
     def take_logs(self):text=''.join(self.lines);self.lines=[];return text

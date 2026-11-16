@@ -1,5 +1,7 @@
 """Read-only native leader input and generation-based handover. No CAN TX path."""
 import fcntl,json,math,struct,threading,time
+from collections import defaultdict,deque
+from rtc_piper.observations import NotReady
 from pathlib import Path
 import numpy as np
 
@@ -18,7 +20,7 @@ class Leader:
         except BaseException:self.file.close();raise
         try:self.bus=can.Bus(channel='can0',interface='socketcan',receive_own_messages=False)
         except BaseException:self.file.close();raise
-        self.lock=threading.Lock();self.frames={};self.error=None;self.stop=threading.Event()
+        self.lock=threading.Lock();self.frames={};self.history=defaultdict(lambda:deque(maxlen=128));self.error=None;self.stop=threading.Event()
         self.thread=threading.Thread(target=self.read,daemon=True);self.thread.start()
     def read(self):
         try:
@@ -27,39 +29,75 @@ class Leader:
                 if m is None:continue
                 if m.is_error_frame:raise RuntimeError('Leader CAN error')
                 if m.is_extended_id or m.is_remote_frame or len(m.data)!=8:continue
-                if m.arbitration_id not in (0x155,0x156,0x157,0x159):continue
                 stamp=time.monotonic()-max(0.,time.time()-m.timestamp)
-                with self.lock:self.frames[m.arbitration_id]=(bytes(m.data),stamp)
+                with self.lock:
+                    self.frames[m.arbitration_id]=(bytes(m.data),stamp);self.history[m.arbitration_id].append((bytes(m.data),stamp))
         except BaseException as e:self.error=str(e)
-    def vector(self):
+    def since(self,cid,after):
+        with self.lock:return [(d,t) for d,t in self.history[cid] if t>after]
+    def get(self,ids,max_age=.15):
         if self.error:raise RuntimeError(self.error)
-        with self.lock:frames=[self.frames.get(k) for k in (0x155,0x156,0x157,0x159)]
-        if any(f is None or not -.01<=time.monotonic()-f[1]<=.15 for f in frames):raise RuntimeError('主臂控制帧缺失/超时；请先在数采程序配置好主臂拖动模式')
-        q=np.array([v for data,_ in frames[:3] for v in struct.unpack('>ii',data)])*math.pi/180000
+        with self.lock:frames=[self.frames.get(k) for k in ids]
+        if any(f is None or not -.01<=time.monotonic()-f[1]<=max_age for f in frames):raise NotReady('主臂报文缺失/超时')
+        return frames
+    def vector(self):
+        frames=self.get((0x155,0x156,0x157,0x159));q=np.array([v for data,_ in frames[:3] for v in struct.unpack('>ii',data)])*math.pi/180000
         data=frames[3][0]
         if (data[6]>>2)&1:raise RuntimeError('Leader gripper must use travel mode')
         width=struct.unpack('>i',data[:4])[0]/1e6-self.cfg['leader_gripper_closed_raw']/1e6
         if not math.isfinite(width) or not -.02<=width<=self.cfg['gripper_max_m']+.02:raise RuntimeError('Leader gripper mapping invalid')
         width=np.clip(width*float(self.cfg.get('gripper_scale',1)),0,self.cfg['gripper_max_m'])
         return np.r_[q,width],np.array([f[1] for f in frames])
+    def feedback(self):
+        frames=self.get((0x2A5,0x2A6,0x2A7))
+        q=np.array([v for data,_ in frames for v in struct.unpack('>ii',data)])*math.pi/180000
+        return np.r_[q,0.],np.array([f[1] for f in frames])
+    def status(self):
+        frames=self.get([0x2A1]+list(range(0x261,0x267)),.25);data=frames[0][0]
+        if data[1]!=0 or int.from_bytes(data[6:8],'big') or any(d[5]&0xBF for d,_ in frames[1:]):raise RuntimeError('主臂保护/驱动故障')
+        if data[0]!=1 or data[2]!=1 or not all(d[5]&0x40 for d,_ in frames[1:]):raise NotReady('Waiting for enabled leader CAN/MOVEJ feedback')
     def close(self):
         self.stop.set();self.thread.join(1);self.bus.shutdown();self.file.close()
 
 class Handover:
-    def __init__(self):
+    def __init__(self,aligner=None):
         self.lock=threading.RLock();self.requested=False;self.generation=0;self.mode='policy';self.after=float('-inf')
-        self.anchor=None;self.follow=None
+        self.anchor=None;self.follow=None;self.aligner=aligner;self.samples=deque(maxlen=50);self.stable_since=None;self.align_started=False
     def toggle(self):
         with self.lock:self.requested=True
-    def switch(self,previous,leader,now):
-        """Called by sole TX owner; initial human target equals last sent command."""
+    def switch(self,measured,leader,now):
+        """Freeze the follower first; never sample/move the master on this path."""
         self.generation+=1;self.after=now;self.requested=False
         if self.mode=='human':self.mode='policy';self.anchor=None
+        elif self.mode=='aligning':raise RuntimeError('主臂对齐中再次按I，已请求停止；请重新开始本轮')
         else:
-            anchor,self.leader_times=leader.vector();self.anchor=np.array(anchor,copy=True);self.follow=np.array(previous,copy=True);self.mode='human'
+            self.follow=np.array(measured,copy=True);self.mode='aligning';self.samples.clear();self.stable_since=None;self.align_started=False
         return self.mode
+    def poll_alignment(self,measured,now):
+        if self.aligner is None:raise RuntimeError('Leader auto alignment backend unavailable')
+        if np.max(np.abs(measured[:6]-self.follow[:6]))>np.radians(1):raise RuntimeError('从臂保持姿态偏移，停止主臂对齐')
+        if not self.align_started:
+            self.samples.append((now,np.array(measured,copy=True)))
+            recent=[q for t,q in self.samples if now-t<=.22]
+            stationary=(self.samples and now-self.samples[0][0]>=.2 and len(recent)>2
+                        and np.max(np.ptp(np.array(recent)[:,:6],axis=0))<=np.radians(.1)
+                        and abs(measured[6]-self.follow[6])<=.003)
+            self.stable_since=(self.stable_since or now) if stationary else None
+            if self.stable_since is not None and now-self.stable_since>=.3:
+                self.aligner.start(self.follow);self.align_started=True
+            elif now-self.after>3:raise RuntimeError('从臂未稳定停止，未启动主臂对齐')
+            return False
+        if self.aligner.error:raise RuntimeError(self.aligner.error)
+        if self.aligner.result is None:return False
+        q,stamps=self.aligner.result
+        self.anchor=np.array(q,copy=True);self.leader_times=np.array(stamps,copy=True)
+        self.mode='human';self.generation+=1;self.after=now
+        return True
     def target(self,leader):
-        q,self.leader_times=leader.vector()
-        return self.follow+(q-self.anchor),q,self.leader_times
+        q,self.leader_times=leader.vector();target=np.array(q,copy=True)
+        # Six joints are now physically aligned. The passive teaching handle is
+        # NOT motor-driven: only gripper input retains a clutch offset.
+        target[6]=self.follow[6]+q[6]-self.anchor[6]
+        return target,q,self.leader_times
     def accepts(self,generation,observed_at):
         return generation==self.generation and observed_at>self.after and not self.requested

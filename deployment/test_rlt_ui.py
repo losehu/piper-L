@@ -48,7 +48,7 @@ class UiTests(unittest.TestCase):
         preview=e.preview();image=Image.open(io.BytesIO(base64.b64decode(preview['images']['cam0'])))
         self.assertEqual(image.size,(300,225));self.assertEqual(preview['camera_capture_t'],10.)
     def test_demo_never_constructs_controller_and_can_complete_workflow(self):
-        demo=Demo('/unused');demo.start();demo.send('takeover');self.assertEqual(demo.state['mode'],'human')
+        demo=Demo('/unused');demo.start();demo.send('takeover');self.assertEqual(demo.state['mode'],'aligning');demo.align_until=0;demo.poll();self.assertEqual(demo.state['mode'],'human')
         demo.send('resume');self.assertEqual(demo.state['mode'],'policy');demo.send('failure')
         self.assertEqual(demo.state['outcome'],0);self.assertFalse(demo.active)
 

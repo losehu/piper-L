@@ -46,6 +46,14 @@ def main():
             return dict(generation=generation,actions=actions,rlt=dict(z_rl=np.zeros(512),proprio=state.copy(),
                 ref_chunk=actions[:18],proposed_chunk=actions[:18],source='base',actor_version=0))
         def close(self):self.closed=True
+    class FakeAligner:
+        error=None;phase='idle';progress=0.
+        def start(self,target):self.target=np.array(target);self.began=time.monotonic();self.phase='moving'
+        @property
+        def result(self):
+            if not hasattr(self,'began') or time.monotonic()-self.began<.12:return None
+            self.phase='ready';return self.target.copy(),np.full(4,time.monotonic())
+    h.aligner=FakeAligner()
     def keys():
         for deadline in [.3,1.7,2.4,3.1]:
             time.sleep(max(0,epoch+deadline-time.monotonic()));h.toggle()
@@ -53,11 +61,13 @@ def main():
     try:run(a.root,Arm(),SimpleNamespace(check=lambda:None),Bank(),Guard(),policy,state.copy(),epoch-.2,cfg,rec,h,Leader())
     except Finished:pass
     finally:thread.join()
-    if len(rec.events)!=4 or not any(c[2]==2 for c in rec.commands):raise RuntimeError('Handover was not exercised')
+    if len(rec.events)!=6 or not any(c[2]==2 for c in rec.commands):raise RuntimeError('Handover was not exercised')
     if not all(p['t']>next(e['t'] for e in rec.events if e['generation']==p['generation']) for p in rec.plans if p['generation']):raise RuntimeError('Stale chunk accepted')
     # At least one in-flight request crossed each handover; none may be accepted afterwards.
     for p in rec.plans:
         if any(e['generation']>p['generation'] and e['t']<p['received'] for e in rec.events):raise RuntimeError('Old generation accepted')
+    holds=[c[1] for c in rec.commands if c[2]==5]
+    if len(holds)<50 or np.max(np.ptp(np.array(holds),axis=0))>1e-5:raise RuntimeError('Follower hold drifted during leader alignment')
     gaps=np.diff([c[0] for c in rec.commands])
     report=dict(status='passed',hardware_opened=False,robot_commands_sent=0,saved_formal_data=False,
                 handovers=len(rec.events),accepted_plans=len(rec.plans),software_commands=len(rec.commands),max_control_gap_ms=float(max(gaps)*1000))

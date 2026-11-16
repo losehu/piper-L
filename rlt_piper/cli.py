@@ -78,14 +78,15 @@ def check(directory,stage,settings):
 def execute(directory,stage,settings,learn,leader_config):
     from rtc_piper.hardware import follower_lock,check_interface,SdkArm
     from rtc_piper.observations import CaptureBank,RealSense
-    from rtc_piper.safety import Guard,terminal_mode
+    from rtc_piper.safety import terminal_mode
+    from rlt_piper.dual_safety import Guard
     from rtc_piper.control import wait_ready,choose_start,prepare
     from rtc_piper.cli import live_settings
     from rlt_piper.control import run
     from rlt_piper.recording import Recorder
     from rlt_piper.labels import Labels
     guard=Guard(settings['channel'],policy_timeout_s=.8);process=policy=arm=cameras=labels=recorder=lock=None
-    terminal=None;error=None;leader=None;ui=None
+    terminal=None;error=None;leader=None;ui=None;aligner=None
     def signal_stop(*_):
         guard.stop.value=1
         if not guard.armed.value:raise KeyboardInterrupt
@@ -100,7 +101,9 @@ def execute(directory,stage,settings,learn,leader_config):
             print('BASE WARMUP：当前由冻结π0.5控制；回放和BC预热完成后才在新chunk启用actor。',flush=True)
         guard.check();check_interface(settings);settings=live_settings(settings)
         from rlt_piper.hil import Leader,Handover
-        leader=Leader(leader_config);handover=Handover()
+        leader=Leader(leader_config)
+        from rlt_piper.leader_align import Aligner
+        aligner=Aligner(leader,guard);handover=Handover(aligner)
         bank=CaptureBank();arm=SdkArm(settings,bank,guard);cameras=RealSense(settings,bank)
         state,stamps,code,enabled,obs=wait_ready(arm,cameras,bank,guard)
         if code==0 and any(enabled):raise RuntimeError('Arm already enabled by another session')
@@ -136,6 +139,7 @@ def execute(directory,stage,settings,learn,leader_config):
                 if policy:policy.close()
                 if cameras:cameras.close()
                 if arm:arm.close()
+                if aligner:aligner.close()
                 if leader:leader.close()
                 if recorder:print('RLT episode:',recorder.save(terminal,error),flush=True)
             finally:
