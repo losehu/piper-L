@@ -1,4 +1,4 @@
-"""Read-only native leader input and generation-based handover. No CAN TX path."""
+"""Native leader input, read-only link probes and generation-based handover."""
 import fcntl,json,math,struct,threading,time
 from collections import defaultdict,deque
 from rtc_piper.observations import NotReady
@@ -42,14 +42,53 @@ class Leader:
         bad=[('0x%03X'%cid)+(' 缺失' if frame is None else ' 超时 %.0fms'%((now-frame[1])*1000)) for cid,frame in zip(ids,frames) if frame is None or not -.01<=now-frame[1]<=max_age]
         if bad:raise NotReady('主臂报文缺失/超时：'+', '.join(bad))
         return frames
-    def vector(self):
-        frames=self.get((0x155,0x156,0x157,0x159));q=np.array([v for data,_ in frames[:3] for v in struct.unpack('>ii',data)])*math.pi/180000
+    def vector(self,max_age=.15):
+        frames=self.get((0x155,0x156,0x157,0x159),max_age);q=np.array([v for data,_ in frames[:3] for v in struct.unpack('>ii',data)])*math.pi/180000
+        if max(t for _,t in frames)-min(t for _,t in frames)>.05:raise NotReady('主臂示教帧时间差超过50ms')
         data=frames[3][0]
         if (data[6]>>2)&1:raise RuntimeError('Leader gripper must use travel mode')
         width=struct.unpack('>i',data[:4])[0]/1e6-self.cfg['leader_gripper_closed_raw']/1e6
         if not math.isfinite(width) or not -.02<=width<=self.cfg['gripper_max_m']+.02:raise RuntimeError('Leader gripper mapping invalid')
         width=np.clip(width*float(self.cfg.get('gripper_scale',1)),0,self.cfg['gripper_max_m'])
-        return np.r_[q,width],np.array([f[1] for f in frames])
+        result=np.r_[q,width],np.array([f[1] for f in frames]);self.held_native=(result[0].copy(),result[1].copy())
+        return result
+    def invalidate_native(self):
+        with self.lock:
+            for cid in (0x155,0x156,0x157,0x159):self.frames.pop(cid,None)
+        self.held_native=None;self.partial_since=None
+    def reset_link(self):
+        self.link_started=time.monotonic();self.link_response=self.link_started;self.link_query=float('-inf')
+    def check_link(self):
+        """Collector's 5Hz firmware ping; no enable or movement frames."""
+        import can
+        if self.error:raise RuntimeError(self.error)
+        if not hasattr(self,'link_started'):self.reset_link()
+        now=time.monotonic()
+        with self.lock:
+            reply=self.frames.get(0x4AF);status=self.frames.get(0x2A1)
+            drivers=[self.frames.get(cid) for cid in range(0x261,0x267)]
+        if status and now-status[1]<=.25 and (status[0][1] or int.from_bytes(status[0][6:8],'big')):raise RuntimeError('主臂固件保护/故障反馈')
+        if any(row and now-row[1]<=.25 and row[0][5]&0xBF for row in drivers):raise RuntimeError('主臂驱动故障反馈')
+        if reply and reply[1]>self.link_started:self.link_response=max(self.link_response,reply[1])
+        if now-self.link_query>=.2:
+            self.bus.send(can.Message(arbitration_id=0x4AF,data=bytes([1,0,0,0,0,0,0,0]),is_extended_id=False),timeout=.02);self.link_query=now
+        if now-self.link_response>.5:raise RuntimeError('can0 在线查询超过500ms无回复')
+    def following(self):
+        self.check_link()
+        try:
+            result=self.vector();self.partial_since=None;return result
+        except NotReady:
+            now=time.monotonic()
+            with self.lock:recent=any(cid in self.frames and now-self.frames[cid][1]<.15 for cid in (0x155,0x156,0x157,0x159))
+            if recent:
+                self.partial_since=getattr(self,'partial_since',None) or now
+                if now-self.partial_since>.05:raise RuntimeError('主臂部分示教帧持续缺失')
+            else:self.partial_since=None
+            held=getattr(self,'held_native',None)
+            if held is None:raise
+            # Silent-at-rest is normal. Preserve original sample timestamps;
+            # only the independent query establishes current link liveness.
+            return held[0].copy(),held[1].copy()
     def feedback(self):
         frames=self.get((0x2A5,0x2A6,0x2A7))
         q=np.array([v for data,_ in frames for v in struct.unpack('>ii',data)])*math.pi/180000
@@ -106,7 +145,7 @@ class Handover:
         self.mode='human';self.generation+=1;self.after=now
         return True
     def target(self,leader):
-        q,self.leader_times=leader.vector();target=np.array(q,copy=True)
+        q,self.leader_times=getattr(leader,'following',leader.vector)();target=np.array(q,copy=True)
         # Six joints are now physically aligned. The passive teaching handle is
         # NOT motor-driven: only gripper input retains a clutch offset.
         target[6]=self.follow[6]+q[6]-self.anchor[6]

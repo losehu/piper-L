@@ -1,4 +1,4 @@
-"""Conservative leader geometry, held follower and additional damping tests."""
+"""Offline geometry and collector-compatible leader preparation tests."""
 import json,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +11,7 @@ from rlt_piper.leader_align import Aligner,software_version
 MODEL=Path(__file__).resolve().parents[1]/'rlt_piper/leader_geometry.json'
 if not MODEL.is_file():MODEL=Path(__file__).resolve().parent/'rlt_piper/leader_geometry.json'
 class AlignmentTests(unittest.TestCase):
-    def test_inflated_official_teaching_tool_refuses_folded_pose(self):
+    def test_offline_envelope_flags_folded_pose(self):
         model=Model(MODEL);q=np.radians([-3.92,.22,0,7.55,13.86,-16.82])
         self.assertIn('leader_tool',model.collision(q))
         with self.assertRaisesRegex(RuntimeError,'goal collision'):model.plan(np.radians([0,30,-60,0,30,0]),q)
@@ -50,36 +50,45 @@ class AlignmentTests(unittest.TestCase):
     def test_stop_latch_is_checked_before_every_can_send(self):
         a=Aligner.__new__(Aligner);a.guard=SimpleNamespace(stop=SimpleNamespace(value=1))
         with self.assertRaisesRegex(RuntimeError,'Stop latched'):a.send(0x155,bytes(8))
-    def test_small_measured_boundary_error_does_not_expand_command_range(self):
+    def test_live_firmware_limits_clip_targets_without_geometry_gate(self):
+        import struct
         a=Aligner(None,SimpleNamespace(stop=SimpleNamespace(value=0)))
-        q=np.radians([0,-.024,-60,0,30,0]);bounded=a.measured_start(q)
-        self.assertEqual(bounded[1],0);self.assertEqual(a.model.collision(q),'joint limits');self.assertIsNone(a.model.collision(bounded))
-        a.send=lambda *_:self.fail('Invalid target sent')
-        with self.assertRaisesRegex(RuntimeError,'指令超限'):a.joints(q)
-        q[1]=np.radians(-.101)
-        with self.assertRaisesRegex(RuntimeError,'joint limits'):a.measured_start(q)
-    def test_measured_boundary_tolerance_does_not_bypass_tool_collision(self):
-        a=Aligner(None,SimpleNamespace(stop=SimpleNamespace(value=0)))
-        q=np.radians([9.535,-.024,-.184,1.095,30.448,-31.161])
-        with self.assertRaisesRegex(RuntimeError,'base/leader_tool'):a.measured_start(q)
+        a.lower_mdeg=np.array([-150000,0,-170000,-127000,-89500,-170000]);a.upper_mdeg=np.array([150000,180000,0,127000,89500,170000])
+        a.lower=np.radians(a.lower_mdeg/1000);a.upper=np.radians(a.upper_mdeg/1000)
+        packets=[];a.send=lambda cid,data:packets.append((cid,data))
+        a.joints(np.radians([999,-.499,-4.791,19.897,6.452,-30.815]))
+        values=np.array([v for _,d in packets for v in struct.unpack('>ii',d)])
+        self.assertEqual(values[0],150000);self.assertEqual(values[1],0)
+        self.assertTrue(np.all(values>=a.lower_mdeg));self.assertTrue(np.all(values<=a.upper_mdeg))
+        for q in [np.full(6,np.nan),np.zeros(7)]:
+            with self.assertRaisesRegex(RuntimeError,'Invalid leader'):a.joints(q)
 
 
 class ProtocolSimulationTests(unittest.TestCase):
-    def simulate(self,version='V1.8.9'):
+    def simulate(self,version='V1.8.9',initial=None,quiet=False,stale_home=False,stopped=False,link_failure=False,homed=False):
         import struct,sys
         clock=SimpleNamespace(t=10.)
         clock.monotonic=lambda:clock.t
         clock.sleep=lambda seconds:setattr(clock,'t',clock.t+seconds)
         packets=[];targets=[]
         class Leader:
-            def __init__(self):self.q=np.radians([0,30,-60,0,30,0]);self.desired=self.q.copy();self.updated=clock.t;self.error=None;self.role=0xFA;self.query=1;self.bus=self;self.native=False
+            def __init__(self):self.q=np.radians([0,30,-60,0,30,0] if initial is None else initial);self.desired=self.q.copy();self.updated=clock.t;self.error=None;self.role=0xFA;self.query=1;self.bus=self;self.native=False;self.cached=None;self.homing=False;self.percent=100
             def advance(self):
-                self.q=self.desired+(self.q-self.desired)*np.exp(-(clock.t-self.updated)/.06);self.updated=clock.t
-            def vector(self):
+                dt=clock.t-self.updated;change=(self.desired-self.q)*(1-np.exp(-dt/.06));self.q+=np.clip(change,-self.percent/100*dt,self.percent/100*dt);self.updated=clock.t
+            def get(self,*args):return [(bytes([2,int(stopped),1,0,0,0,0,0]),clock.t)]
+            def reset_link(self):pass
+            def check_link(self):
+                if link_failure:raise RuntimeError('firmware query no response')
+            def invalidate_native(self):self.cached=None;self.native=False
+            def vector(self,max_age=.15):
                 if not self.native:raise RuntimeError('Native teaching commands silent until drag restored')
                 if self.role!=0xFA:raise RuntimeError('Native frames unavailable in controlled mode')
                 self.advance()
-                return np.r_[self.q,.04],np.full(4,clock.t+.0001)
+                if self.homing and stale_home:return np.r_[self.q,.04],np.full(4,9.)
+                if quiet and self.cached is not None:return self.cached
+                result=np.r_[self.q,.04],np.full(4,clock.t+.0001)
+                if quiet and (not self.homing or np.max(np.abs(np.degrees(self.q)))<=.8):self.cached=result
+                return result
             def feedback(self):self.advance();return np.r_[self.q,0.],np.full(3,clock.t+.0001)
             def status(self):
                 if self.role!=0xFC:raise RuntimeError('Not in controlled mode')
@@ -98,21 +107,24 @@ class ProtocolSimulationTests(unittest.TestCase):
             def send(self,message,timeout):
                 cid,data=message.arbitration_id,message.data;packets.append((cid,data))
                 if cid==0x470:self.role=data[0]
-                elif cid==0x191:self.native=True
+                elif cid==0x191:
+                    self.native=True;self.homing=bool(data[2]);self.cached=None
+                    if self.homing:self.advance();self.desired=np.zeros(6);self.percent=100
+                elif cid==0x151:self.advance();self.percent=data[2]
                 elif cid==0x472:self.query=data[0]
                 elif cid in (0x155,0x156,0x157):
                     self.advance();i=(cid-0x155)*2;self.desired[i:i+2]=np.radians(np.array(struct.unpack('>ii',data))/1000)
                     if cid==0x157:targets.append((clock.t,self.desired.copy()))
         leader=Leader();guard=SimpleNamespace(stop=SimpleNamespace(value=0),leader_active=SimpleNamespace(value=0))
-        align=Aligner(leader,guard);align.target=np.r_[np.radians([2,31,-61,0,30,0]),.02]
+        align=Aligner(leader,guard);align.homed=homed;align.target=np.r_[np.radians([2,31,-61,0,30,0]),.02]
         with patch('rlt_piper.leader_align.time',clock),patch.dict(sys.modules,{'can':SimpleNamespace(Message=lambda **kw:SimpleNamespace(**kw))}):align.run()
         return align,guard,packets,targets
-    def test_complete_switch_align_restore_uses_no_disable_reset_or_gripper(self):
+    def test_complete_native_home_align_restore_uses_no_disable_or_gripper(self):
         align,guard,packets,targets=self.simulate()
         self.assertIsNone(align.error);self.assertIsNotNone(align.result);self.assertEqual(align.phase,'ready')
         self.assertFalse(guard.stop.value);self.assertTrue(guard.leader_active.value)
-        self.assertFalse({0x150,0x159,0x471}&{cid for cid,_ in packets})
-        roles=[data[0] for cid,data in packets if cid==0x470];self.assertEqual(roles,[0xFC,0xFA])
+        self.assertFalse({0x150,0x159}&{cid for cid,_ in packets});self.assertTrue(all(data==bytes([7,2,0,0,0,0,0,0]) for cid,data in packets if cid==0x471))
+        roles=[data[0] for cid,data in packets if cid==0x470];self.assertEqual(roles,[0xFA,0xFC,0xFA]);self.assertIn((0x191,bytes([1,0,1,0,0,0,0,0])),packets)
         self.assertEqual(packets[-1],(0x191,bytes([1,0,0,0,0,0,0,0])))
         for (ta,a),(tb,b) in zip(targets,targets[1:]):
             if tb>ta:self.assertLessEqual(float(np.degrees(np.abs(b-a)).max())/(tb-ta),5.05)
@@ -128,7 +140,7 @@ class ProtocolSimulationTests(unittest.TestCase):
         self.assertEqual(software_version(raw),'S-V1.9-1')
         align,guard,packets,_=self.simulate(raw)
         self.assertIsNone(align.error);self.assertEqual(align.phase,'ready');self.assertFalse(guard.stop.value)
-        self.assertFalse({0x150,0x159,0x471}&{cid for cid,_ in packets})
+        self.assertFalse({0x150,0x159}&{cid for cid,_ in packets});self.assertTrue(all(data==bytes([7,2,0,0,0,0,0,0]) for cid,data in packets if cid==0x471))
     def test_incomplete_or_malformed_response_refused_before_motion(self):
         for raw in [b'H-V1.9-1',bytes(88),b'H-V1.2-1'+bytes(80),b'H-V1.2-1'+bytes(80)+bytes(8)]:
             with self.subTest(raw=raw):
@@ -138,5 +150,31 @@ class ProtocolSimulationTests(unittest.TestCase):
         raw=bytearray(88);raw[:8]=b'H-V1.9-9';raw[60:68]=b'S-V1.8-4';raw[68:74]=b'261116'
         align,guard,packets,_=self.simulate(bytes(raw))
         self.assertIsNotNone(align.error);self.assertEqual([cid for cid,_ in packets],[0x4AF])
+
+    def test_actual_rest_pose_can_use_collector_native_home(self):
+        align,guard,packets,_=self.simulate(initial=[9.431,-.499,-4.791,19.897,6.452,-30.815])
+        self.assertIsNone(align.error);self.assertTrue(align.homed);self.assertFalse(guard.stop.value)
+        self.assertIn((0x191,bytes([1,0,1,0,0,0,0,0])),packets)
+    def test_subsequent_takeover_does_not_repeat_firmware_home(self):
+        align,guard,packets,_=self.simulate(homed=True)
+        self.assertIsNone(align.error);self.assertFalse(guard.stop.value)
+        self.assertFalse(any(cid==0x191 and d[2] for cid,d in packets))
+        self.assertEqual([d[0] for cid,d in packets if cid==0x470],[0xFC,0xFA])
+    def test_native_zero_may_go_silent_with_live_link(self):
+        align,guard,_,_=self.simulate(quiet=True)
+        self.assertIsNone(align.error);self.assertEqual(align.phase,'ready');self.assertFalse(guard.stop.value)
+    def test_pre_home_cached_zero_cannot_complete_home(self):
+        align,guard,packets,_=self.simulate(stale_home=True)
+        self.assertIn('回零30秒',align.error);self.assertTrue(guard.stop.value)
+        self.assertFalse(any(cid==0x470 and d[0]==0xFC for cid,d in packets))
+    def test_dead_link_prevents_entering_positioning(self):
+        align,guard,packets,_=self.simulate(link_failure=True)
+        self.assertIn('firmware query',align.error);self.assertTrue(guard.stop.value)
+        self.assertFalse(any(cid==0x470 and d[0]==0xFC for cid,d in packets))
+    def test_reported_firmware_stop_is_recovered_with_reset_not_disable(self):
+        align,guard,packets,_=self.simulate(stopped=True)
+        self.assertIsNone(align.error);self.assertFalse(guard.stop.value)
+        self.assertIn((0x150,bytes([2,0,0,0,0,0,0,0])),packets)
+        self.assertFalse(any(cid==0x471 and d[1]!=2 for cid,d in packets))
 
 if __name__=='__main__':unittest.main()

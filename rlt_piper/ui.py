@@ -40,7 +40,7 @@ class App:
         tools=tk.Frame(controls,bg='white');tools.pack(fill='x',pady=(0,9))
         self.check_button=tk.Button(tools,text='模型检查·不动臂',command=lambda:self.start(check=True),bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.check_button.pack(side='left',fill='x',expand=True,padx=(0,4))
         self.can_button=tk.Button(tools,text='恢复CAN',command=self.restore_can,bd=0,bg='#e9eef5',fg=INK,pady=7,cursor='hand2');self.can_button.pack(side='left',fill='x',expand=True)
-        tk.Label(controls,text='启动会自动准备、对齐并执行。\n接管将自动移动主臂，请松手让开。',justify='left',wraplength=240,bg='white',fg=MUTED,font=('Noto Sans CJK SC',9)).pack(anchor='w')
+        tk.Label(controls,text='启动会自动准备、对齐并执行。\n首次接管主臂先厂家回零，再低速对齐。请松手让开。',justify='left',wraplength=240,bg='white',fg=MUTED,font=('Noto Sans CJK SC',9)).pack(anchor='w')
         cameras=tk.Frame(body,bg=BG);cameras.pack(side='left',expand=True,fill='both')
         self.camera_labels={}
         for key,title in [('cam0','CAM 01 · 场景相机'),('cam1','CAM 02 · 手腕相机')]:
@@ -110,7 +110,7 @@ class App:
         if 'joint_deg' in state:self.detail.configure(text='关节角度 °   '+ '   '.join('%6.1f'%v for v in state['joint_deg'])+'     夹爪 %.1f mm'%state.get('gripper_mm',0))
         elif phase=='idle':self.detail.configure(text='机械臂未启动 · Corrector 关闭')
         training={'waiting_for_replay':'等待有效回放','training':'后台训练中','learning_paused':'训练已暂停','off':'后台训练关闭'}.get(learner.get('status'),'等待训练状态')
-        if mode=='aligning' and active:training='从臂保持中 · 主臂对齐 '+{'follower_stopping':'等待从臂实测停稳，主臂未启动','checking':'核对固件 / 限位','countdown':'即将移动，请松手','planning':'检查整条路径','mode_switch':'切换定位模式','moving':'低速对齐','settling':'确认稳定','restoring_drag':'恢复拖动'}.get(state.get('alignment_phase'),str(state.get('alignment_phase','')))+' %.0f%%'%(100*state.get('alignment_progress',0))
+        if mode=='aligning' and active:training='从臂保持中 · 主臂对齐 '+{'follower_stopping':'等待从臂实测停稳，主臂未启动','native_home':'厂家回零，速度由固件控制','checking':'核对固件 / 限位','countdown':'即将移动，请松手','planning':'检查整条路径','mode_switch':'切换定位模式','moving':'低速对齐','settling':'确认稳定','restoring_drag':'恢复拖动'}.get(state.get('alignment_phase'),str(state.get('alignment_phase','')))+' %.0f%%'%(100*state.get('alignment_progress',0))
         if active:self.training.configure(text=training+(' · BC 预热，当前由 π0.5 控制' if not learner.get('ready') and source=='base' else '')+(' · '+learner['error'] if learner.get('error') else ''),fg=RED if learner.get('error') else TEAL)
         elif state.get('outcome') is not None:self.training.configure(text='本轮已标记：'+('成功' if state['outcome']==1 else '失败')+'。重开下一轮即可继续采集和学习。')
         elif phase in ('stopped','error','finished'):self.training.configure(text=PHASE[phase]+'，请查看日志。')
