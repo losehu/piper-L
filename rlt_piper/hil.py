@@ -112,7 +112,7 @@ class Handover:
         if self.mode=='human':self.mode='policy';self.anchor=None
         elif self.mode=='aligning':raise RuntimeError('主臂对齐中再次按I，已请求停止；请重新开始本轮')
         else:
-            self.follow=np.array(measured,copy=True);self.mode='aligning';self.samples.clear();self.stable_since=None;self.align_started=False
+            self.follow=np.array(measured,copy=True);self.mode='aligning';self.samples.clear();self.stable_since=None;self.align_started=False;self.measured_hold=None
             previous=self.follow if previous_command is None else np.asarray(previous_command)
             if previous.shape!=self.follow.shape or not np.isfinite(previous).all():raise RuntimeError('Invalid pre-takeover command')
             # Until the servo has stopped, residual travel may remain between
@@ -127,17 +127,17 @@ class Handover:
             if np.any(measured[:6]<self.stop_lower) or np.any(measured[:6]>self.stop_upper):raise RuntimeError('从臂停稳过程超出接管前指令范围，未启动主臂对齐')
             self.samples.append((now,np.array(measured,copy=True)))
             recent=[q for t,q in self.samples if now-t<=.22]
+            motion=np.ptp(np.array(recent),axis=0)
             stationary=(self.samples and now-self.samples[0][0]>=.2 and len(recent)>2
-                        and np.max(np.ptp(np.array(recent)[:,:6],axis=0))<=np.radians(.1)
-                        and np.max(np.abs(measured[:6]-self.follow[:6]))<=np.radians(.5)
-                        and abs(measured[6]-self.follow[6])<=.003)
+                        and np.max(motion[:6])<=np.radians(.1) and motion[6]<=.0003)
             self.stable_since=(self.stable_since or now) if stationary else None
             if self.stable_since is not None and now-self.stable_since>=.3:
-                self.aligner.start(self.follow);self.align_started=True
+                self.measured_hold=np.array(measured,copy=True)
+                self.aligner.start(self.measured_hold);self.align_started=True
                 print('从臂实测已停稳并保持：开始主臂对齐检查。',flush=True)
-            elif now-self.after>3:raise RuntimeError('从臂未稳定停止，未启动主臂对齐')
+            elif now-self.after>3:raise RuntimeError('从臂未稳定停止：窗口关节波动 %.3f°，夹爪波动 %.3fmm；未启动主臂对齐'%(np.degrees(max(motion[:6])),motion[6]*1000))
             return False
-        if np.max(np.abs(measured[:6]-self.follow[:6]))>np.radians(1):raise RuntimeError('从臂保持姿态偏移，停止主臂对齐')
+        if np.max(np.abs(measured[:6]-self.measured_hold[:6]))>np.radians(1):raise RuntimeError('从臂保持姿态偏移，停止主臂对齐')
         if self.aligner.error:raise RuntimeError(self.aligner.error)
         if self.aligner.result is None:return False
         q,stamps=self.aligner.result
@@ -145,10 +145,11 @@ class Handover:
         self.mode='human';self.generation+=1;self.after=now
         return True
     def target(self,leader):
-        q,self.leader_times=getattr(leader,'following',leader.vector)();target=np.array(q,copy=True)
-        # Six joints are now physically aligned. The passive teaching handle is
-        # NOT motor-driven: only gripper input retains a clutch offset.
-        target[6]=self.follow[6]+q[6]-self.anchor[6]
+        q,self.leader_times=getattr(leader,'following',leader.vector)()
+        # Align to measured pose, while preserving the held actuator setpoint.
+        # This small clutch offset compensates static servo error and the
+        # leader's alignment error without a command jump at handover.
+        target=self.follow+(q-self.anchor)
         return target,q,self.leader_times
     def accepts(self,generation,observed_at):
         return generation==self.generation and observed_at>self.after and not self.requested

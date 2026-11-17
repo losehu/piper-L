@@ -7,7 +7,7 @@ import numpy as np
 class Finished(Exception):pass
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--lagged-servo',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--lagged-servo',action='store_true');p.add_argument('--servo-bias-deg',type=float,default=0.);a=p.parse_args()
     from rtc_piper.cli import config
     from rtc_piper.profiles import select_model
     from rtc_piper.observations import Observation
@@ -17,13 +17,14 @@ def main():
     cfg=select_model(config(a.root/'config.yaml'),'pi05',a.root)
     with np.load(a.root/'offline_sample.npz') as d:state=np.array(d['state']);images={k:np.array(d[k]) for k in ['cam0','cam1']}
     state[:6]=np.clip(state[:6],cfg['policy_command_lower_rad'],cfg['policy_command_upper_rad']);epoch=time.monotonic()
+    bias=np.zeros(6);bias[4]=np.radians(a.servo_bias_deg)
     servo=SimpleNamespace(target=state[:6].copy(),velocity=np.zeros(6),updated=epoch,lock=threading.Lock())
     def measured():
         if a.lagged_servo:
             with servo.lock:
                 now=time.monotonic();remaining=now-servo.updated
                 while remaining>1e-9:
-                    dt=min(.001,remaining);servo.velocity+=(144*(servo.target-state[:6])-24*servo.velocity)*dt;state[:6]+=servo.velocity*dt;remaining-=dt
+                    dt=min(.001,remaining);servo.velocity+=(144*(servo.target+bias-state[:6])-24*servo.velocity)*dt;state[:6]+=servo.velocity*dt;remaining-=dt
                 servo.updated=now
         return state.copy()
     h=Handover();rec=Recorder(a.output.parent/'unsaved_software_trace','online','synthetic',cfg)
@@ -48,7 +49,8 @@ def main():
         def status(self,**kw):pass
     class Leader:
         def vector(self):
-            q=measured();q[0]+=.02*np.sin((time.monotonic()-epoch)*3)
+            if getattr(self,'generation',None)!=h.generation:self.generation=h.generation;self.epoch=time.monotonic()
+            q=np.array(h.aligner.target,copy=True);q[0]+=.02*np.sin((time.monotonic()-self.epoch)*3)
             return q,np.full(4,time.monotonic())
     class Policy:
         def __init__(self):self.requests=[];self.closed=False
@@ -82,8 +84,11 @@ def main():
         holds=[c[1] for c in rec.commands if c[2]==5 and c[3]==generation]
         if len(holds)<50 or np.max(np.ptp(np.array(holds),axis=0))>1e-5:raise RuntimeError('Follower hold command changed during leader alignment')
     gaps=np.diff([c[0] for c in rec.commands])
+    human_entries=[i for i,c in enumerate(rec.commands) if c[2]==2 and (i==0 or rec.commands[i-1][2]!=2)]
+    jumps=[float(np.max(np.abs(rec.commands[i][1]-rec.commands[i-1][1]))) for i in human_entries if i]
+    if any(v>1e-5 for v in jumps):raise RuntimeError('Human handover command jumped')
     report=dict(status='passed',hardware_opened=False,robot_commands_sent=0,saved_formal_data=False,
-                lagged_servo=a.lagged_servo,handovers=len(rec.events),accepted_plans=len(rec.plans),software_commands=len(rec.commands),max_control_gap_ms=float(max(gaps)*1000))
+                lagged_servo=a.lagged_servo,servo_bias_deg=a.servo_bias_deg,human_command_entry_max_delta=max(jumps,default=0.),handovers=len(rec.events),accepted_plans=len(rec.plans),software_commands=len(rec.commands),max_control_gap_ms=float(max(gaps)*1000))
     a.output.write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report),flush=True)
 
 if __name__=='__main__':main()

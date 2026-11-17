@@ -32,8 +32,8 @@ class Recorder:
              np.full(7,np.nan) if measured is None else np.array(measured,copy=True),
              np.full(4,np.nan) if state_times is None else np.array(state_times,copy=True))
         with self.lock:self.commands.append(row)
-    def event(self,mode,generation,stamp):
-        with self.lock:self.events.append(dict(mode=mode,generation=generation,t=stamp))
+    def event(self,mode,generation,stamp,**details):
+        with self.lock:self.events.append(dict(mode=mode,generation=generation,t=stamp,**details))
     def start(self):
         self.directory.mkdir(parents=True,exist_ok=False)
         self.thread=threading.Thread(target=self._journal,daemon=True);self.thread.start()

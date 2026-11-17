@@ -48,7 +48,8 @@ class HilTests(unittest.TestCase):
         for dt,offset in [(0.,0.),(.01,.156),(.02,.315),(.03,.281),(.04,.531),(.05,.736),(.06,.861),(.07,1.032)]:
             q=held.copy();q[1]=np.radians(offset);self.assertFalse(h.poll_alignment(q,10+dt))
         self.assertFalse(targets)
-        # A stationary offset alone is insufficient: it must reach the hold target.
+        # A plateau shorter than the observation plus confirmation interval
+        # cannot start the leader; a command-position error is not motion.
         for dt in np.arange(.08,.5,.01):
             q=held.copy();q[1]=np.radians(1.032);h.poll_alignment(q,10+dt)
         self.assertFalse(targets)
@@ -68,6 +69,36 @@ class HilTests(unittest.TestCase):
         h.switch(held,None,10,previous_command=old)
         q=held.copy();q[1]=np.radians(1.1)
         with self.assertRaisesRegex(RuntimeError,'未稳定停止'):h.poll_alignment(q,13.01)
+    def test_static_servo_offset_aligns_to_measured_pose_without_command_jump(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda q:setattr(align,'target',q.copy()))
+        held=np.zeros(7);held[6]=.04;h=Handover(align);h.switch(held,None,10)
+        actual=held.copy();actual[:6]+=np.radians([-.052,.222,.224,0,.63,-.026]);actual[6]+=.004
+        for now in np.arange(10.01,10.9,.01):h.poll_alignment(actual,now)
+        self.assertTrue(h.align_started);np.testing.assert_array_equal(align.target,actual)
+        np.testing.assert_array_equal(h.follow,held)
+        aligned=actual.copy();aligned[0]+=np.radians(.2);aligned[6]=.07
+        align.result=(aligned.copy(),np.full(4,11.))
+        self.assertTrue(h.poll_alignment(actual,11.))
+        leader=SimpleNamespace(vector=lambda:(aligned.copy(),np.full(4,11.)))
+        np.testing.assert_allclose(h.target(leader)[0],held,atol=1e-15)
+        aligned[1]+=np.radians(2);aligned[6]+=.005
+        expected=held.copy();expected[1]+=np.radians(2);expected[6]+=.005
+        np.testing.assert_allclose(h.target(leader)[0],expected,atol=1e-15)
+    def test_hold_drift_is_relative_to_stationary_measured_baseline(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda _:None)
+        h=Handover(align);h.switch(np.zeros(7),None,10)
+        actual=np.zeros(7);actual[4]=np.radians(.63)
+        for now in np.arange(10.01,10.9,.01):h.poll_alignment(actual,now)
+        self.assertTrue(h.align_started)
+        actual[4]+=np.radians(.6);h.poll_alignment(actual,11.)
+        actual[4]+=np.radians(.41)
+        with self.assertRaisesRegex(RuntimeError,'保持姿态偏移'):h.poll_alignment(actual,11.1)
+    def test_gripper_motion_still_prevents_alignment(self):
+        align=SimpleNamespace(error=None,result=None,start=lambda _:self.fail('Gripper still moving'))
+        h=Handover(align);held=np.zeros(7);h.switch(held,None,10)
+        for i in range(200):
+            q=held.copy();q[6]=.001*np.sin(i*.5);h.poll_alignment(q,10+i*.01)
+        self.assertFalse(h.align_started)
     def recorder(self,root,source='human',boundary=False):
         r=Recorder(root,'online','token',CFG)
         for i in range(16):

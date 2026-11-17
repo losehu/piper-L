@@ -82,7 +82,8 @@ def run(root,arm,cameras,bank,guard,policy,previous,after,settings,recorder,hand
                 actual=np.r_[np.rint(np.degrees(command[:6])*1000)*np.pi/180000,np.rint(command[6]*1e6)/1e6]
                 recorder.command(time.monotonic(),actual,source,h.generation,raw_leader,leader_times,measured,stamps)
                 if h.mode=='aligning' and h.poll_alignment(measured,time.monotonic()):
-                    recorder.event('human',h.generation,h.after)
+                    recorder.event('human',h.generation,h.after,mapping='aligned_clutch',
+                        command_anchor=h.follow.tolist(),leader_anchor=h.anchor.tolist(),measured_hold=h.measured_hold.tolist())
                     timeline=Timeline(root,settings,h.after,initial_action=command);smoother=CommandSmoother(command,settings)
                     print('主臂已到位并恢复拖动；开始人工跟随（从臂夹爪不跳变）。',flush=True)
             previous=command;previous_time=now
